@@ -256,16 +256,16 @@ async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
         )
 
 
-# async def stream_tts(output):
-#     for result in output:
-#         yield result.audio
+async def stream_tts(output):
+    for result in output:
+        yield result.audio
 
 
-# @app.post("/v1/audio")
-# async def tts(tts_query: str, voice: Annotated[str, Body()] = "af_heart"):
-#     model = load_tts_model(path=path("models/mlx-community/Kokoro-82M-bf16"))
-#     output = model.generate(tts_query, voice=voice)
-#     for result in output:
-#         sd.play(result.audio, 24000)
-#         sd.wait()
-#     return StreamingResponse(stream_tts(output))
+@app.post("/v1/audio")
+async def tts(tts_query: str, voice: str = "af_heart"):
+    model = load_tts_model(path="models/mlx-community/Kokoro-82M-bf16")
+    output = model.generate(tts_query, voice=voice)
+    for result in output:
+        sd.play(result.audio, 24000)
+        sd.wait()
+    return StreamingResponse(stream_tts(output))
