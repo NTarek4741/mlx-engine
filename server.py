@@ -2,6 +2,8 @@ from typing import Annotated
 import base64
 import time
 import os
+import gc
+import mlx.core as mx
 
 from mlx_engine.generate import load_model, create_generator, tokenize
 from mlx_engine.utils.token import Token
@@ -11,6 +13,8 @@ from fastapi import FastAPI, Body
 from fastapi.responses import StreamingResponse
 from huggingface_hub import snapshot_download
 import json
+from mlx_engine.model_kit.model_kit import ModelKit
+from mlx_engine.vision_model_kit.vision_model_kit import VisionModelKit
 
 # Import schema from feilds.py
 from feilds import (
@@ -35,6 +39,7 @@ import sounddevice as sd
 
 
 app = FastAPI()
+loaded_model_cache = {"model": None, "params": {}}
 
 
 @app.put("/download")
@@ -120,7 +125,6 @@ async def generate_output(generator, stats_collector, logprobs_list, generate_qu
         result_text += generation_result.text
         stats_collector.add_tokens(generation_result.tokens)
         logprobs_list.extend(generation_result.top_logprobs)
-
     finish_reason = "length"
     if generation_result and generation_result.stop_condition:
         stats_collector.print_stats()
@@ -176,19 +180,41 @@ async def generate_output(generator, stats_collector, logprobs_list, generate_qu
 
 @app.post("/v1/messages")
 async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
-    # Create a progress reporter that wraps the percent callback
-    # The event callback always returns True to continue processing
-    print("Loading model...", end="\n", flush=True)
-    print(generate_query.model)
-    model_kit = load_model(
-        f"models/{generate_query.model}",
-        max_kv_size=generate_query.max_kv_size,
-        trust_remote_code=False,
-        kv_bits=generate_query.kv_bits,
-        kv_group_size=generate_query.kv_group_size,
-        quantized_kv_start=generate_query.quantized_kv_start,
-    )
-    print("\rModel load complete ✓", end="\n", flush=True)
+    global loaded_model_cache
+
+    current_params = {
+        "model_path": f"models/{generate_query.model}",
+        "max_kv_size": generate_query.max_kv_size,
+        "kv_bits": generate_query.kv_bits,
+        "kv_group_size": generate_query.kv_group_size,
+        "quantized_kv_start": generate_query.quantized_kv_start,
+    }
+
+    if loaded_model_cache["params"] == current_params:
+        model_kit = loaded_model_cache["model"]
+        print("Model already loaded ✓", end="\n", flush=True)
+    else:
+        # Clear previous model implementation
+        if loaded_model_cache["model"] != None:
+            del loaded_model_cache["model"]
+            mx.clear_cache()
+            gc.collect()
+            print("Model cleared ✓", end="\n", flush=True)
+        print("Loading model...", end="\n", flush=True)
+        print(current_params)
+        model_kit = load_model(
+            current_params["model_path"],
+            max_kv_size=current_params["max_kv_size"],
+            trust_remote_code=False,
+            kv_bits=current_params["kv_bits"],
+            kv_group_size=current_params["kv_group_size"],
+            quantized_kv_start=current_params["quantized_kv_start"],
+        )
+        print("\rModel load complete ✓", end="\n", flush=True)
+
+        loaded_model_cache["model"] = model_kit
+        loaded_model_cache["params"] = current_params
+
     tf_tokenizer = AutoProcessor.from_pretrained(generate_query.model)
     images_base64 = []
     for message in generate_query.messages:
@@ -203,7 +229,6 @@ async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
                         images_base64.append(content.source.data)  # type: ignore
     # Build conversation with optional system prompt and tool definitions
     conversation = generate_query.messages
-
     # Add tools to system message if provided
     if generate_query.tools:
         tools_text = format_tools_for_model(generate_query.tools, generate_query.model)
@@ -256,16 +281,16 @@ async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
         )
 
 
-async def stream_tts(output):
-    for result in output:
-        yield result.audio
+# async def stream_tts(output):
+#     for result in output:
+#         yield result.audio
 
 
-@app.post("/v1/audio")
-async def tts(tts_query: str, voice: str = "af_heart"):
-    model = load_tts_model(path="models/mlx-community/Kokoro-82M-bf16")
-    output = model.generate(tts_query, voice=voice)
-    for result in output:
-        sd.play(result.audio, 24000)
-        sd.wait()
-    return StreamingResponse(stream_tts(output))
+# @app.post("/v1/audio")
+# async def tts(tts_query: str, voice: str = "af_heart"):
+#     model = load_tts_model(path="models/mlx-community/Kokoro-82M-bf16")
+#     output = model.generate(tts_query, voice=voice)
+#     for result in output:
+#         sd.play(result.audio, 24000)
+#         sd.wait()
+#     return StreamingResponse(stream_tts(output))

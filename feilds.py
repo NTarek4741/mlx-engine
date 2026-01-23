@@ -4,20 +4,6 @@ from pydantic import AfterValidator, BaseModel, Field
 
 
 # =============================================================================
-# Cache Control
-# =============================================================================
-
-
-class CacheControlEphemeral(BaseModel):
-    """Cache control breakpoint configuration."""
-
-    type: Literal["ephemeral"]
-    ttl: Literal["5m", "1h"] | None = Field(
-        default=None, description="Time-to-live for the cache"
-    )
-
-
-# =============================================================================
 # Image Source Types
 # =============================================================================
 
@@ -94,9 +80,6 @@ class TextBlockParam(BaseModel):
 
     text: str = Field(description="Text content")
     type: Literal["text"]
-    cache_control: CacheControlEphemeral | None = Field(
-        default=None, description="Cache control configuration"
-    )
 
 
 class ImageBlockParam(BaseModel):
@@ -104,9 +87,6 @@ class ImageBlockParam(BaseModel):
 
     source: ImageSource = Field(description="Image source")
     type: Literal["image"]
-    cache_control: CacheControlEphemeral | None = Field(
-        default=None, description="Cache control configuration"
-    )
 
 
 class DocumentBlockParam(BaseModel):
@@ -114,9 +94,6 @@ class DocumentBlockParam(BaseModel):
 
     source: DocumentSource = Field(description="Document source")
     type: Literal["document"]
-    cache_control: CacheControlEphemeral | None = Field(
-        default=None, description="Cache control configuration"
-    )
     context: str | None = Field(
         default=None, description="Additional context for the document"
     )
@@ -130,9 +107,6 @@ class ToolUseBlockParam(BaseModel):
     input: dict[str, Any] = Field(description="Input parameters for the tool")
     name: str = Field(description="Name of the tool to use")
     type: Literal["tool_use"]
-    cache_control: CacheControlEphemeral | None = Field(
-        default=None, description="Cache control configuration"
-    )
 
 
 class ToolResultBlockParam(BaseModel):
@@ -140,9 +114,6 @@ class ToolResultBlockParam(BaseModel):
 
     tool_use_id: str = Field(description="ID of the tool use this is responding to")
     type: Literal["tool_result"]
-    cache_control: CacheControlEphemeral | None = Field(
-        default=None, description="Cache control configuration"
-    )
     content: (
         str
         | list[
@@ -254,16 +225,6 @@ class Tool(BaseModel):
         default=None, description="Description of what this tool does"
     )
     type: Literal["custom"] | None = Field(default=None, description="Tool type")
-    cache_control: CacheControlEphemeral | None = Field(
-        default=None, description="Cache control configuration"
-    )
-
-
-# =============================================================================
-# Constants
-# =============================================================================
-
-DEFAULT_TEMP = 0.7
 
 
 # =============================================================================
@@ -300,7 +261,7 @@ class ChatCompletionParams(BaseModel):
 
     # Core Sampling Parameters
     temperature: float | None = Field(
-        default=DEFAULT_TEMP,
+        default=0.6,
         ge=0.0,
         le=1.0,
         description="Sampling temperature (0.0-1.0)",
@@ -348,7 +309,6 @@ class ChatCompletionParams(BaseModel):
     )
     kv_bits: int | None = Field(
         default=None,
-        alias="kv-bits",
         ge=3,
         le=8,
         description="Number of bits for KV cache quantization. Must be between 3 and 8",
