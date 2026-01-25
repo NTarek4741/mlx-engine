@@ -1,108 +1,91 @@
 from typing import Annotated
-import base64
-import time
+
 import os
 import gc
 import mlx.core as mx
 
 from mlx_engine.generate import load_model, create_generator, tokenize
-from mlx_engine.utils.token import Token
 from mlx_engine.utils.prompt_progress_reporter import LoggerReporter
 from transformers import AutoTokenizer, AutoProcessor
 from fastapi import FastAPI, Body
 from fastapi.responses import StreamingResponse
 from huggingface_hub import snapshot_download
-import json
-from mlx_engine.model_kit.model_kit import ModelKit
-from mlx_engine.vision_model_kit.vision_model_kit import VisionModelKit
 
-# Import schema from feilds.py
-from feilds import (
-    ChatCompletionParams,
-    ChatCompletionResponse,
-    Choice,
-    Usage,
-    MessageParam,
-    ToolUseBlockParam,
-    DEFAULT_TEMP,
-    TextBlockParam,
-    ContentBlockParam,
-)
+from feilds import ChatCompletionParams
 
 # Import tool formatting
-from tools import format_tools_for_model, detect_tool_calls
+from tools import format_tools_for_model
 
 from mlx_audio.tts.utils import load_model as load_tts_model
 
 # remove this import after finished with audio
 import sounddevice as sd
 
+# Import model conversion utilities
+from mlx_lm import convert as mlx_lm_convert
+from mlx_vlm import convert as mlx_vlm_convert
+
+# Import utility functions
+from server_utils import (
+    image_to_base64,
+    GenerationStatsCollector,
+    generate_stream,
+    generate_output,
+)
+
 
 app = FastAPI()
 loaded_model_cache = {"model": None, "params": {}}
 
 
-@app.put("/download")
+@app.put("v1/download")
 async def download(repo_id: str):
-    creator, model = repo_id.split("/")
-    snapshot_download(repo_id=repo_id, local_dir=f"./models/{creator}/{model}")
+    """
+    Download a model from Hugging Face Hub.
 
+    This endpoint downloads the specified model repository from Hugging Face to the local
+    `./models` directory. It organizes models by creator and model name.
 
-# Schemas now imported from feilds.py
+    Args:
+        repo_id: The Hugging Face repository ID in the format "creator/model_name"
+                 (e.g., "meta-llama/Llama-2-7b-hf").
 
-
-def image_to_base64(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
-
-
-class GenerationStatsCollector:
-    def __init__(self):
-        self.start_time = time.time()
-        self.first_token_time = None
-        self.total_tokens = 0
-        self.num_accepted_draft_tokens: int | None = None
-
-    def add_tokens(self, tokens: list[Token]):
-        """Record new tokens and their timing."""
-        if self.first_token_time is None:
-            self.first_token_time = time.time()
-
-        draft_tokens = sum(1 for token in tokens if token.from_draft)
-        if self.num_accepted_draft_tokens is None:
-            self.num_accepted_draft_tokens = 0
-        self.num_accepted_draft_tokens += draft_tokens
-
-        self.total_tokens += len(tokens)
-
-    def print_stats(self):
-        """Print generation statistics."""
-        end_time = time.time()
-        total_time = end_time - self.start_time
-
-        # Check if first token was generated
-        if self.first_token_time is None:
-            print("\n\nNo tokens generated")
-            return
-
-        time_to_first_token = self.first_token_time - self.start_time
-        effective_time = total_time - time_to_first_token
-        tokens_per_second = (
-            self.total_tokens / effective_time if effective_time > 0 else float("inf")
-        )
-        print("\n\nGeneration stats:")
-        print(f" - Tokens per second: {tokens_per_second:.2f}")
-        if self.num_accepted_draft_tokens is not None:
-            print(
-                f" - Number of accepted draft tokens: {self.num_accepted_draft_tokens}"
-            )
-        print(f" - Time to first token: {time_to_first_token:.2f}s")
-        print(f" - Total tokens generated: {self.total_tokens}")
-        print(f" - Total time: {total_time:.2f}s")
+    Returns:
+        dict: A JSON object indicating success or failure.
+            Success format:
+            {
+                "status": "success",
+                "message": "Model {repo_id} downloaded successfully"
+            }
+            Error format:
+            {
+                "status": "error",
+                "message": "{error_details}"
+            }
+    """
+    try:
+        creator, model = repo_id.split("/")
+        snapshot_download(repo_id=repo_id, local_dir=f"./models/{creator}/{model}")
+        return {
+            "status": "success",
+            "message": f"Model {repo_id} downloaded successfully",
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.get("/v1/models")
 async def models():
+    """
+    List available models in the local `models` directory.
+
+    Scans the `./models` directory and returns a list of all downloaded models
+    that are available for loading.
+
+    Returns:
+        list[str]: A list of model paths in the format "creator/model_name".
+                   Example: ["mlx-community/Llama-2-7b-mlx", "google/gemma-7b"]
+    """
     models = []
     for model in os.listdir("./models"):
         for file in os.listdir(f"./models/{model}"):
@@ -111,75 +94,128 @@ async def models():
     return models
 
 
-async def generate_stream(generator):
-    for generation_result in generator:
-        # print(generation_result.text, end="", flush=True)
-        yield json.dumps({"content": generation_result.text, "ID": "12345"})
+@app.post("/v1/convert")
+async def convert_model(repo_id: str, output_dir: str = None):
+    """
+    Convert a Hugging Face model to MLX format.
 
+    This endpoint attempts to convert a model using `mlx_lm.convert` first (for text models).
+    If that fails, it tries `mlx_vlm.convert` (for vision-language models).
+    It applies 4-bit quantization by default.
 
-async def generate_output(generator, stats_collector, logprobs_list, generate_query):
-    result_text = ""
-    generation_result = None
+    Args:
+        repo_id: Hugging Face repository ID (e.g., "meta-llama/Llama-2-7b-hf").
+                 Must be a repo that exists on HF or locally.
+        output_dir: Optional output directory. If not provided, defaults to `./models/{repo_id}`.
 
-    for generation_result in generator:
-        result_text += generation_result.text
-        stats_collector.add_tokens(generation_result.tokens)
-        logprobs_list.extend(generation_result.top_logprobs)
-    finish_reason = "length"
-    if generation_result and generation_result.stop_condition:
-        stats_collector.print_stats()
+    Returns:
+        dict: A JSON object with conversion status and details.
+            Success format:
+            {
+                "status": "success",
+                "message": "...",
+                "output_path": "...",
+                "converter": "mlx_lm" | "mlx_vlm",
+                "quantization": "4-bit"
+            }
+            Error format:
+            {
+                "status": "error",
+                "message": "Model conversion failed",
+                "details": { "mlx_lm_error": "...", "mlx_vlm_error": "..." }
+            }
+    """
+    # Set default output directory if not provided
+    if output_dir is None:
+        output_dir = f"./models/{repo_id}"
+    try:
+        # Second attempt: Try mlx_vlm.convert with 4-bit quantization
         print(
-            f"\nStopped generation due to: {generation_result.stop_condition.stop_reason}"
+            f"Attempting to convert {repo_id} using mlx_vlm.convert with 4-bit quantization..."
         )
-        if generation_result.stop_condition.stop_string:
-            print(f"Stop string: {generation_result.stop_condition.stop_string}")
+        mlx_vlm_convert(
+            hf_path=repo_id,
+            mlx_path=output_dir,
+            quantize=True,
+            q_group_size=64,
+            q_bits=4,
+        )
+        return {
+            "status": "success",
+            "message": f"Model {repo_id} successfully converted using mlx_vlm with 4-bit quantization",
+            "output_path": output_dir,
+            "converter": "mlx_vlm",
+            "quantization": "4-bit",
+        }
+    except Exception as vlm_error:
+        print(f"mlx_vlm.convert failed: {str(vlm_error)}")
+    try:
+        # First attempt: Try mlx_lm.convert with 4-bit quantization
+        print(
+            f"Attempting to convert {repo_id} using mlx_lm.convert with 4-bit quantization..."
+        )
+        mlx_lm_convert(
+            hf_path=repo_id,
+            mlx_path=output_dir,
+            quantize=True,
+            q_group_size=64,
+            q_bits=4,
+        )
+        return {
+            "status": "success",
+            "message": f"Model {repo_id} successfully converted using mlx_lm with 4-bit quantization",
+            "output_path": output_dir,
+            "converter": "mlx_lm",
+            "quantization": "4-bit",
+        }
+    except Exception as lm_error:
+        print(f"mlx_lm.convert failed: {str(lm_error)}")
 
-        if generation_result.stop_condition.stop_reason == "stop_string":
-            finish_reason = "stop"
-        elif generation_result.stop_condition.stop_reason == "end_token":
-            finish_reason = "stop"
-
-    if generate_query.top_logprobs:
-        [print(x) for x in logprobs_list]
-
-    # Detect tool calls
-    content: list[ContentBlockParam] = []
-    tool_calls = detect_tool_calls(result_text, generate_query.model)
-
-    if tool_calls:
-        finish_reason = "tool_calls"
-        content.extend(tool_calls)
-
-        # Add text if detected and not empty
-        if len(result_text.strip()) > 0:
-            content.insert(0, TextBlockParam(type="text", text=result_text))
-    else:
-        # Standard text response
-        content = [TextBlockParam(type="text", text=result_text)]
-
-    # Construct structured response
-    return ChatCompletionResponse(
-        id=f"chatcmpl-{int(time.time())}",
-        created=int(time.time()),
-        model=generate_query.model,
-        choices=[
-            Choice(
-                index=0,
-                message=MessageParam(role="assistant", content=content),
-                finish_reason=finish_reason,
-                logprobs=None,
-            )
-        ],
-        usage=Usage(
-            prompt_tokens=0,  # TODO: Track prompt tokens
-            completion_tokens=stats_collector.total_tokens,
-            total_tokens=stats_collector.total_tokens,
-        ),
-    )
+    # Both converters failed
+    return {
+        "status": "error",
+        "message": "Model conversion failed",
+        "details": {
+            "mlx_lm_error": str(lm_error),
+            "mlx_vlm_error": str(vlm_error),
+        },
+    }
 
 
 @app.post("/v1/messages")
 async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
+    """
+    Generate a chat completion response.
+
+    This endpoint accepts a chat history and generation parameters to produce a response
+    from the loaded model. It supports both text and vision inputs (if the model supports vision).
+
+    Args:
+        generate_query (ChatCompletionParams): A Pydantic model containing:
+            - messages (list): List of message objects (role, content). Content can be text or list of content blocks (text/image).
+            - model (str): Path/name of the model to use (must be capable of loading).
+            - temperature (float): Sampling temperature.
+            - max_tokens (int): Maximum tokens to generate.
+            - stream (bool): Whether to stream the response.
+            - ... (other params like top_p, tools, etc.)
+
+    Returns:
+        ChatCompletionResponse (JSON) if stream=False:
+            {
+                "id": "...",
+                "created": 1234567890,
+                "model": "model_name",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": [...] },
+                    "finish_reason": "stop" | "length" | "tool_calls"
+                }],
+                "usage": { ... }
+            }
+
+        StreamingResponse (SSE) if stream=True:
+            Yields chunks of JSON data containing generated text deltas.
+    """
     global loaded_model_cache
 
     current_params = {
@@ -277,20 +313,25 @@ async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
         return StreamingResponse(generate_stream(generator))
     else:
         return await generate_output(
-            generator, stats_collector, logprobs_list, generate_query
+            generator,
+            stats_collector,
+            logprobs_list,
+            generate_query,
+            len(prompt_tokens),
         )
 
 
-# async def stream_tts(output):
-#     for result in output:
-#         yield result.audio
+async def stream_tts(output):
+    for result in output:
+        yield result.audio
 
 
-# @app.post("/v1/audio")
-# async def tts(tts_query: str, voice: str = "af_heart"):
-#     model = load_tts_model(path="models/mlx-community/Kokoro-82M-bf16")
-#     output = model.generate(tts_query, voice=voice)
-#     for result in output:
-#         sd.play(result.audio, 24000)
-#         sd.wait()
-#     return StreamingResponse(stream_tts(output))
+@app.post("/v1/audio")
+async def tts(tts_query: str, voice: str = "af_heart"):
+    model = load_tts_model(path="models/mlx-community/Kokoro-82M-bf16")
+    output = model.generate(tts_query, voice=voice)
+    # for testing purposes
+    for result in output:
+        sd.play(result.audio, 24000)
+        sd.wait()
+    return StreamingResponse(stream_tts(output))

@@ -32,6 +32,8 @@ ImageSource = Union[Base64ImageSource, URLImageSource]
 # Document Source Types
 # =============================================================================
 
+# Work In Progress
+
 
 class Base64PDFSource(BaseModel):
     """Base64-encoded PDF source."""
@@ -41,6 +43,7 @@ class Base64PDFSource(BaseModel):
     type: Literal["base64"]
 
 
+# Work In Progress
 class PlainTextSource(BaseModel):
     """Plain text document source."""
 
@@ -49,6 +52,7 @@ class PlainTextSource(BaseModel):
     type: Literal["text"]
 
 
+# Work In Progress
 class ContentBlockSource(BaseModel):
     """Content block-based document source."""
 
@@ -58,6 +62,7 @@ class ContentBlockSource(BaseModel):
     type: Literal["content"]
 
 
+# Work In Progress
 class URLPDFSource(BaseModel):
     """URL-based PDF source."""
 
@@ -130,6 +135,26 @@ class ToolResultBlockParam(BaseModel):
     )
 
 
+# FOR TRANSLATE GEMMA MODELS
+class TranslateTextBlockParam(BaseModel):
+    """Translation content block."""
+
+    type: Literal["text"] = Field(description="Text content")
+    source_lang_code: str = Field(description="Source language code")
+    target_lang_code: str = Field(description="Target language code")
+    text: str = Field(description="Text content")
+
+
+# FOR TRANSLATE GEMMA MODELS
+class TranslateImageBlockParam(BaseModel):
+    """Translation content block."""
+
+    type: Literal["image"] = Field(description="Text content")
+    source_lang_code: str = Field(description="Source language code")
+    target_lang_code: str = Field(description="Target language code")
+    image: ImageSource = Field(description="Image source")
+
+
 # =============================================================================
 # Content Block Union
 # =============================================================================
@@ -140,6 +165,8 @@ ContentBlockParam = Union[
     DocumentBlockParam,
     ToolUseBlockParam,
     ToolResultBlockParam,
+    TranslateTextBlockParam,
+    TranslateImageBlockParam,
 ]
 
 
@@ -353,6 +380,9 @@ class Usage(BaseModel):
     prompt_tokens: int = Field(description="Number of tokens in the prompt")
     total_tokens: int = Field(
         description="Total number of tokens used (prompt + completion)"
+    )
+    tokens_per_second: float | None = Field(
+        default=None, description="Token generation rate (tokens/second)"
     )
 
 

@@ -3,7 +3,6 @@ Tool formatting module for MLX Engine.
 
 Provides model-specific tool calling templates for:
 - Qwen 2.5+
-- Llama 3.x
 - Mistral
 
 Handles:
@@ -92,56 +91,6 @@ def detect_tool_call_qwen(text: str) -> list[dict[str, Any]] | None:
 
 
 # =============================================================================
-# Llama 3.x Tool Format
-# =============================================================================
-
-
-def format_tools_llama(tools: list[Tool]) -> str:
-    """
-    Format tools for Llama 3.x models.
-
-    Llama uses a different function tag format.
-    """
-    if not tools:
-        return ""
-
-    tools_prompt = "You have access to these tools:\n\n"
-    for tool in tools:
-        tools_prompt += f"Function: {tool.name}\n"
-        if tool.description:
-            tools_prompt += f"Description: {tool.description}\n"
-        tools_prompt += f"Parameters: {json.dumps(tool.input_schema.model_dump(exclude_none=True))}\n\n"
-
-    return tools_prompt
-
-
-def detect_tool_call_llama(text: str) -> list[dict[str, Any]] | None:
-    """
-    Detect tool calls in Llama 3.x output.
-
-    Llama formats:
-    ```
-    <function=web_search>{"query": "MLX"}</function>
-    ```
-    """
-    pattern = r"<function=(.*?)>(.*?)</function>"
-    matches = re.findall(pattern, text, re.DOTALL)
-
-    if not matches:
-        return None
-
-    tool_calls = []
-    for i, (name, args_str) in enumerate(matches):
-        try:
-            args = json.loads(args_str.strip())
-            tool_calls.append({"id": f"call_{i}", "name": name, "input": args})
-        except json.JSONDecodeError:
-            continue
-
-    return tool_calls if tool_calls else None
-
-
-# =============================================================================
 # Mistral Tool Format
 # =============================================================================
 
@@ -205,14 +154,12 @@ def detect_model_type(model_path: str) -> str:
     """
     Detect model type from path.
 
-    Returns: "qwen", "llama", "mistral", or "unknown"
+    Returns: "qwen", "mistral", or "unknown"
     """
     model_lower = model_path.lower()
 
     if "qwen" in model_lower:
         return "qwen"
-    elif "llama" in model_lower:
-        return "llama"
     elif "mistral" in model_lower:
         return "mistral"
     else:
@@ -227,7 +174,6 @@ def format_tools_for_model(tools: list[Tool], model_path: str) -> str:
 
     formatters = {
         "qwen": format_tools_qwen,
-        "llama": format_tools_llama,
         "mistral": format_tools_mistral,
     }
 
@@ -243,7 +189,6 @@ def detect_tool_calls(text: str, model_path: str) -> list[ToolUseBlockParam] | N
 
     detectors = {
         "qwen": detect_tool_call_qwen,
-        "llama": detect_tool_call_llama,
         "mistral": detect_tool_call_mistral,
     }
 
