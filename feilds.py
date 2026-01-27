@@ -4,6 +4,20 @@ from pydantic import AfterValidator, BaseModel, Field
 
 
 # =============================================================================
+# Speach Model
+# =============================================================================
+class SpeachModel(BaseModel):
+    """Speach model."""
+
+    text: str = Field(description="Text content")
+    model: str = Field(description="Model name")
+    voice: str = Field(description="Voice name")
+    speed: float | None = Field(description="Speed of the speech")
+    lang_code: str | None = Field(description="Language code")
+    ref_audio: str | None = Field(description="Reference audio")
+
+
+# =============================================================================
 # Image Source Types
 # =============================================================================
 
@@ -363,6 +377,106 @@ class ChatCompletionParams(BaseModel):
     )
     json_schema: str | None = Field(
         default=None, description="JSON schema for the response"
+    )
+
+
+# =============================================================================
+# OpenAI-Compatible Request Params
+# =============================================================================
+
+
+def clamp_temperature(value: float | None) -> float | None:
+    """Clamp temperature values greater than 1 to 1."""
+    if value is not None and value > 1.0:
+        return 1.0
+    return value
+
+
+class StreamOptions(BaseModel):
+    """Options for streaming responses."""
+
+    include_usage: bool | None = Field(
+        default=None, description="Include usage statistics in streaming response"
+    )
+
+
+class OpenAICompletionParams(BaseModel):
+    """
+    OpenAI-compatible chat completion request parameters.
+
+    Supported fields only - ignored fields from OpenAI spec are not included:
+    - logprobs, metadata, response_format, prediction, presence_penalty,
+    - frequency_penalty, seed, service_tier, audio, logit_bias, store,
+    - user, modalities, top_logprobs, reasoning_effort
+    """
+
+    # Required Parameters
+    model: str = Field(description="Model name to use for completion")
+    messages: list[MessageParam] = Field(
+        description="A list of messages comprising the conversation so far."
+    )
+
+    max_tokens: int | None = Field(
+        default=None, ge=1, description="Maximum number of tokens to generate"
+    )
+    max_completion_tokens: int | None = Field(
+        default=None, ge=1, description="Maximum number of tokens to generate"
+    )
+    stream: bool | None = Field(
+        default=False, description="Enable streaming of the response"
+    )
+    stream_options: StreamOptions | None = Field(
+        default=None, description="Options for streaming responses"
+    )
+    top_p: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Use nucleus sampling with this cumulative probability",
+    )
+    parallel_tool_calls: bool | None = Field(
+        default=None, description="Whether to allow parallel tool calls"
+    )
+
+    stop: str | list[str] | None = Field(
+        default=None,
+        description="Stop sequences. All non-whitespace stop sequences work.",
+    )
+    temperature: Annotated[float | None, AfterValidator(clamp_temperature)] = Field(
+        default=None,
+        ge=0.0,
+        description="Sampling temperature (0.0-1.0). Values > 1 are capped at 1.",
+    )
+    n: Literal[1] | None = Field(
+        default=1, description="Number of completions. Must be exactly 1."
+    )
+
+    # Tools (if needed for compatibility)
+    tools: list[Tool] | None = Field(
+        default=None, description="Definitions of tools that the model may use"
+    )
+    tool_choice: ToolChoice | None = Field(
+        default=None, description="How the model should use the provided tools"
+    )
+
+    max_kv_size: int | None = Field(
+        default=None, description="Max context size of the model"
+    )
+    kv_bits: int | None = Field(
+        default=None,
+        ge=3,
+        le=8,
+        description="Number of bits for KV cache quantization. Must be between 3 and 8",
+    )
+    kv_group_size: int | None = Field(
+        default=None, description="Group size for KV cache quantization"
+    )
+    quantized_kv_start: int | None = Field(
+        default=None,
+        description="When --kv-bits is set, start quantizing the KV cache from this step onwards",
+    )
+    top_logprobs: int | None = Field(
+        default=0, description="Number of top logprobs to return"
     )
 
 

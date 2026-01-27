@@ -11,12 +11,12 @@ from fastapi import FastAPI, Body
 from fastapi.responses import StreamingResponse
 from huggingface_hub import snapshot_download
 
-from feilds import ChatCompletionParams
+from feilds import ChatCompletionParams, OpenAICompletionParams, SpeachModel
 
 # Import tool formatting
 from tools import format_tools_for_model
 
-from mlx_audio.tts.utils import load_model as load_tts_model
+from mlx_audio.tts.utils import load_model as load_audio_model
 
 # remove this import after finished with audio
 import sounddevice as sd
@@ -36,6 +36,68 @@ from server_utils import (
 
 app = FastAPI()
 loaded_model_cache = {"model": None, "params": {}}
+
+
+def load_or_get_cached_model(params: ChatCompletionParams | OpenAICompletionParams):
+    """
+    Load a model or retrieve it from cache if already loaded with matching parameters.
+
+    This function checks if the requested model with its parameters is already loaded
+    in the cache. If so, it returns the cached model. Otherwise, it clears any
+    previously loaded model, loads the new one, and caches it.
+
+    Args:
+        params: Either ChatCompletionParams or OpenAICompletionParams containing:
+            - model (str): Path/name of the model to load
+            - max_kv_size (int | None): Max context size
+            - kv_bits (int | None): KV cache quantization bits (3-8)
+            - kv_group_size (int | None): Group size for KV quantization
+            - quantized_kv_start (int | None): Step to start KV quantization
+
+    Returns:
+        The loaded model_kit object ready for generation.
+    """
+    global loaded_model_cache
+
+    current_params = {
+        "model_path": f"models/{params.model}",
+        "max_kv_size": params.max_kv_size,
+        "kv_bits": params.kv_bits,
+        "kv_group_size": params.kv_group_size,
+        "quantized_kv_start": params.quantized_kv_start,
+    }
+
+    if loaded_model_cache["params"] == current_params:
+        print("Model already loaded ✓", end="\n", flush=True)
+        print("✅ Model ready for inference!", end="\n", flush=True)
+        return loaded_model_cache["model"]
+
+    # Clear previous model if one exists
+    if loaded_model_cache["model"] is not None:
+        del loaded_model_cache["model"]
+        mx.clear_cache()
+        gc.collect()
+        print("Model cleared ✓", end="\n", flush=True)
+
+    print("Loading model...", end="\n", flush=True)
+    print(current_params)
+
+    model_kit = load_model(
+        current_params["model_path"],
+        max_kv_size=current_params["max_kv_size"],
+        trust_remote_code=False,
+        kv_bits=current_params["kv_bits"],
+        kv_group_size=current_params["kv_group_size"],
+        quantized_kv_start=current_params["quantized_kv_start"],
+    )
+    print("\rModel load complete ✓", end="\n", flush=True)
+
+    # Update cache
+    loaded_model_cache["model"] = model_kit
+    loaded_model_cache["params"] = current_params
+
+    print("✅ Model ready for inference!", end="\n", flush=True)
+    return model_kit
 
 
 @app.put("v1/download")
@@ -216,41 +278,10 @@ async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
         StreamingResponse (SSE) if stream=True:
             Yields chunks of JSON data containing generated text deltas.
     """
-    global loaded_model_cache
+    # Load model or get from cache
+    model_kit = load_or_get_cached_model(generate_query)
 
-    current_params = {
-        "model_path": f"models/{generate_query.model}",
-        "max_kv_size": generate_query.max_kv_size,
-        "kv_bits": generate_query.kv_bits,
-        "kv_group_size": generate_query.kv_group_size,
-        "quantized_kv_start": generate_query.quantized_kv_start,
-    }
-
-    if loaded_model_cache["params"] == current_params:
-        model_kit = loaded_model_cache["model"]
-        print("Model already loaded ✓", end="\n", flush=True)
-    else:
-        # Clear previous model implementation
-        if loaded_model_cache["model"] != None:
-            del loaded_model_cache["model"]
-            mx.clear_cache()
-            gc.collect()
-            print("Model cleared ✓", end="\n", flush=True)
-        print("Loading model...", end="\n", flush=True)
-        print(current_params)
-        model_kit = load_model(
-            current_params["model_path"],
-            max_kv_size=current_params["max_kv_size"],
-            trust_remote_code=False,
-            kv_bits=current_params["kv_bits"],
-            kv_group_size=current_params["kv_group_size"],
-            quantized_kv_start=current_params["quantized_kv_start"],
-        )
-        print("\rModel load complete ✓", end="\n", flush=True)
-
-        loaded_model_cache["model"] = model_kit
-        loaded_model_cache["params"] = current_params
-
+    # Image Extraction
     tf_tokenizer = AutoProcessor.from_pretrained(generate_query.model)
     images_base64 = []
     for message in generate_query.messages:
@@ -321,15 +352,80 @@ async def generate(generate_query: Annotated[ChatCompletionParams, Body()]):
         )
 
 
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Annotated[OpenAICompletionParams, Body()]):
+    """
+    OpenAI SDK-compatible chat completions endpoint.
+
+    This endpoint provides OpenAI API compatibility while using MLX for inference.
+    It supports the same model loading and caching as /v1/messages.
+    """
+    # Load model or get from cache
+    model_kit = load_or_get_cached_model(request)
+
+    # Convert OpenAI stop format to stop_sequences list
+    stop_sequences = None
+    if request.stop:
+        if isinstance(request.stop, str):
+            stop_sequences = [request.stop]
+        else:
+            stop_sequences = request.stop
+
+    # Use max_tokens or max_completion_tokens (OpenAI supports both)
+    max_tokens = request.max_tokens or request.max_completion_tokens or 100
+
+    # Build prompt from messages
+    tf_tokenizer = AutoTokenizer.from_pretrained(request.model)
+    prompt = tf_tokenizer.apply_chat_template(
+        request.messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_tokens = tokenize(model_kit, prompt)
+
+    # Initialize generation stats collector
+    stats_collector = GenerationStatsCollector()
+    logprobs_list = []
+
+    # Generate the response
+    generator = create_generator(
+        model_kit,
+        prompt_tokens,
+        images_b64=[],  # OpenAI endpoint doesn't handle images in the same way
+        stop_strings=stop_sequences,
+        max_tokens=max_tokens,
+        top_logprobs=0,  # OpenAI has different logprobs handling
+        prompt_progress_reporter=LoggerReporter(),
+        num_draft_tokens=None,
+        temp=request.temperature or 0.7,
+        top_k=None,
+        top_p=request.top_p,
+    )
+
+    if request.stream:
+        return StreamingResponse(generate_stream(generator))
+    else:
+        return await generate_output(
+            generator,
+            stats_collector,
+            logprobs_list,
+            request,
+            len(prompt_tokens),
+        )
+
+
 async def stream_tts(output):
     for result in output:
         yield result.audio
 
 
 @app.post("/v1/audio")
-async def tts(tts_query: str, voice: str = "af_heart"):
-    model = load_tts_model(path="models/mlx-community/Kokoro-82M-bf16")
-    output = model.generate(tts_query, voice=voice)
+async def tts(speach_params: SpeachModel):
+    model = load_audio_model(path=f"models/{speach_params.model}")
+    output = model.generate_audio(
+        text=speach_params.text,
+        voice=speach_params.voice,
+        speed=speach_params.speed,
+        lang_code=speach_params.lang_code,
+    )
     # for testing purposes
     for result in output:
         sd.play(result.audio, 24000)
