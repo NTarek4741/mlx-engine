@@ -3,19 +3,16 @@ from typing import Annotated
 import os
 import gc
 import mlx.core as mx
-
-from mlx_engine.generate import load_model, create_generator, tokenize
+from mlx_engine.generate import load_model, create_generator, tokenize, load_draft_model
 from mlx_engine.utils.prompt_progress_reporter import LoggerReporter
 from transformers import AutoTokenizer, AutoProcessor
 from fastapi import FastAPI, Body
 from fastapi.responses import StreamingResponse
 from huggingface_hub import snapshot_download
 
-from feilds import MessagesParams, SpeachModel
+from anthropic.anthropic_models import MessagesParams, SpeachModel
 
 # Import tool formatting
-from tools import format_tools_for_model
-
 from mlx_audio.tts.utils import load_model as load_audio_model
 
 # remove this import after finished with audio
@@ -90,24 +87,10 @@ async def generate(generate_query: Annotated[MessagesParams, Body()]):
                         images_base64.append(content.source.data)  # type: ignore
     # Build conversation with optional system prompt and tool definitions
     conversation = generate_query.messages
-    # Add tools to system message if provided
-    if generate_query.tools:
-        tools_text = format_tools_for_model(generate_query.tools, generate_query.model)
-        # Prepend tools to system prompt or create new system message
-        if generate_query.system:
-            system_content = (
-                generate_query.system
-                if isinstance(generate_query.system, str)
-                else generate_query.system[0].text
-            )
-            system_content = f"{tools_text}\n\n{system_content}"
-        else:
-            system_content = tools_text
-
-        # Insert system message at beginning (dict format for chat template)
-        conversation = [{"role": "system", "content": system_content}] + list(
-            generate_query.messages
-        )
+    # Insert system message at beginning (dict format for chat template)
+    conversation = [{"role": "system", "content": generate_query.system}] + list(
+        generate_query.messages
+    )
 
     tf_tokenizer = AutoTokenizer.from_pretrained(generate_query.model)
     prompt = tf_tokenizer.apply_chat_template(
@@ -144,7 +127,7 @@ async def generate(generate_query: Annotated[MessagesParams, Body()]):
         )
 
 
-def load_or_get_cached_model(params: ChatCompletionParams):
+def load_or_get_cached_model(params: MessagesParams):
     """
     Load a model or retrieve it from cache if already loaded with matching parameters.
 
@@ -153,12 +136,13 @@ def load_or_get_cached_model(params: ChatCompletionParams):
     previously loaded model, loads the new one, and caches it.
 
     Args:
-        params: ChatCompletionParams containing:
+        params: MessagesParams containing:
             - model (str): Path/name of the model to load
             - max_kv_size (int | None): Max context size
             - kv_bits (int | None): KV cache quantization bits (3-8)
             - kv_group_size (int | None): Group size for KV quantization
             - quantized_kv_start (int | None): Step to start KV quantization
+            - draft_model (str | None): Path/name of the draft model for speculative decoding
 
     Returns:
         The loaded model_kit object ready for generation.
@@ -171,6 +155,7 @@ def load_or_get_cached_model(params: ChatCompletionParams):
         "kv_bits": params.kv_bits,
         "kv_group_size": params.kv_group_size,
         "quantized_kv_start": params.quantized_kv_start,
+        "draft_model": f"models/{params.draft_model}" if params.draft_model else None,
     }
 
     if loaded_model_cache["params"] == current_params:
@@ -197,6 +182,17 @@ def load_or_get_cached_model(params: ChatCompletionParams):
         quantized_kv_start=current_params["quantized_kv_start"],
     )
     print("\rModel load complete ✓", end="\n", flush=True)
+
+    # Load draft model if specified
+    if current_params["draft_model"]:
+        print(
+            f"Loading draft model: {current_params['draft_model']}...",
+            end="\n",
+            flush=True,
+        )
+
+        load_draft_model(model_kit, current_params["draft_model"])
+        print("Draft model loaded ✓", end="\n", flush=True)
 
     # Update cache
     loaded_model_cache["model"] = model_kit
@@ -245,7 +241,7 @@ async def download(repo_id: str):
 @app.get("/v1/models")
 async def models():
     """
-    List available models in the local `models` directory.
+    List available models in the local `models` directory
 
     Scans the `./models` directory and returns a list of all downloaded models
     that are available for loading.
@@ -296,6 +292,10 @@ async def convert_model(repo_id: str, output_dir: str = None):
     # Set default output directory if not provided
     if output_dir is None:
         output_dir = f"./models/{repo_id}"
+    
+    vlm_error = None
+    lm_error = None
+    
     try:
         # Second attempt: Try mlx_vlm.convert with 4-bit quantization
         print(
@@ -315,7 +315,8 @@ async def convert_model(repo_id: str, output_dir: str = None):
             "converter": "mlx_vlm",
             "quantization": "4-bit",
         }
-    except Exception as vlm_error:
+    except Exception as e:
+        vlm_error = e
         print(f"mlx_vlm.convert failed: {str(vlm_error)}")
     try:
         # First attempt: Try mlx_lm.convert with 4-bit quantization
@@ -336,7 +337,8 @@ async def convert_model(repo_id: str, output_dir: str = None):
             "converter": "mlx_lm",
             "quantization": "4-bit",
         }
-    except Exception as lm_error:
+    except Exception as e:
+        lm_error = e
         print(f"mlx_lm.convert failed: {str(lm_error)}")
 
     # Both converters failed
@@ -344,8 +346,8 @@ async def convert_model(repo_id: str, output_dir: str = None):
         "status": "error",
         "message": "Model conversion failed",
         "details": {
-            "mlx_lm_error": str(lm_error),
-            "mlx_vlm_error": str(vlm_error),
+            "mlx_lm_error": str(lm_error) if lm_error else "Not attempted/Unknown",
+            "mlx_vlm_error": str(vlm_error) if vlm_error else "Not attempted/Unknown",
         },
     }
 
@@ -355,8 +357,8 @@ async def stream_tts(output):
         yield result.audio
 
 
-@app.post("/v1/audio")
-async def tts(speach_params: SpeachModel):
+@app.post("/v1/audio/transcriptions")
+async def audio_to_text(speach_params: SpeachModel):
     model = load_audio_model(path=f"models/{speach_params.model}")
     output = model.generate_audio(
         text=speach_params.text,
@@ -369,3 +371,20 @@ async def tts(speach_params: SpeachModel):
         sd.play(result.audio, 24000)
         sd.wait()
     return StreamingResponse(stream_tts(output))
+
+
+@app.post("/v1/audio/speech")
+async def text_to_speech(speach_params: SpeachModel):
+    model = load_audio_model(path=f"models/{speach_params.model}")
+    output = model.generate_audio(
+        text=speach_params.text,
+        voice=speach_params.voice,
+        speed=speach_params.speed,
+        lang_code=speach_params.lang_code,
+    )
+    # for testing purposes
+    for result in output:
+        sd.play(result.audio, 24000)
+        sd.wait()
+    return StreamingResponse(stream_tts(output))
+

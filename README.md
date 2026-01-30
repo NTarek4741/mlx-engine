@@ -10,7 +10,7 @@ MLX Engine enables you to run powerful language and vision models locally on you
 
 ### 🚀 Performance & Optimization
 - **Smart Model Caching** - Models stay loaded in memory across requests for instant response times
-- **Automatic KV Caching** - Intelligent prompt caching that reuses computations from previous requests, reducing processing time by up to 30x for repeated prompts
+- **Automatic KV Caching** - Intelligent prompt caching that reuses computations from previous requests
 - **KV Cache Quantization** - Reduce memory usage with 3-8 bit quantization support
 - **Speculative Decoding** - Accelerate generation using a smaller draft model for faster token generation
 - **Apple Silicon Native** - Leverages Metal GPU acceleration via MLX for optimal performance on Mac
@@ -25,6 +25,7 @@ MLX Engine enables you to run powerful language and vision models locally on you
 ### 🤖 Model Support
 - **Text Models** - Mistral, Qwen, Llama, Gemma, and other transformer-based LLMs
 - **Vision Models** - Support for vision-language models like Gemma 3, Pixtral, Mistral 3 with image understanding capabilities
+- **Audio Models** - Support for audio-language models like kokoro
 - **Easy Model Management** - Download models directly from Hugging Face with a simple API call
 
 ### ⚙️ Advanced Features
