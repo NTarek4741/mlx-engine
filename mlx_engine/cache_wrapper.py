@@ -130,6 +130,7 @@ class CacheWrapper:
         common_prefix = self._find_common_prefix(
             self.tokens, prompt_tokens, num_tokens_to_exclude
         )
+        logger.info(f"Cache debug: cached_token_count={len(self.tokens)}, new_prompt_tokens={len(prompt_tokens)}, common_prefix={common_prefix}")
 
         # Trim the cache if the common prefix is shorter than the current cache
         num_tokens_in_cache = self._get_num_tokens_in_cache()

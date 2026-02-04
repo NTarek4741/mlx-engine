@@ -1,6 +1,25 @@
 from typing import Literal
 from pydantic import BaseModel, Field
 
+class ModelInfo(BaseModel):
+    """Information about a single model."""
+    name: str = Field(description="Model name/path")
+    model: str = Field(description="Full model identifier")
+
+class TagsResponse(BaseModel):
+    """Response body for the /api/tags endpoint."""
+    models: list[ModelInfo] = Field(description="List of available models")
+
+
+class RunningModelInfo(BaseModel):
+    """Information about a currently running/loaded model."""
+    model: str = Field(description="Model name/path")
+
+class PSResponse(BaseModel):
+    """Response body for the /api/ps endpoint."""
+    models: list[RunningModelInfo] = Field(description="List of currently running models")
+
+
 class GenerationOptions(BaseModel):
     """Runtime options that control text generation."""
 
@@ -8,7 +27,7 @@ class GenerationOptions(BaseModel):
         default=None, description="Random seed used for reproducible outputs"
     )
     temperature: float | None = Field(
-        default=None,
+        default=0.15,
         description="Controls randomness in generation (higher = more random)",
     )
     top_k: int | None = Field(
@@ -73,9 +92,31 @@ class GenerateRequest(BaseModel):
         default=None,
         description='Structured output format for the model to generate a response from. Supports either the string "json" or a JSON schema object.',
     )
-    system: str = Field(
-        default="You are a helpful assistant.",
-        description="System prompt for the model to generate a response from",
+    system: str | None = Field(
+        default="""You are a highly capable AI assistant. Follow these rules:
+
+# CONSTRAINT PRIORITY (Most Important)
+User constraints ALWAYS override style preferences. If asked for brevity, be brief. If given a word limit, format, or "just the answer"—obey exactly.
+
+# RESPONSE CALIBRATION
+Match response depth to question complexity:
+- Simple facts → Direct answer, no elaboration
+- "Explain" or "why" → First principles depth
+- Creative requests → Follow the exact format requested
+- Complex tasks → Structured, complete solution
+
+# STYLE
+- Conversational and direct. No AI fluff ("In conclusion," "It's important to note").
+- Use formatting (bold, headers, code blocks) only when it aids comprehension.
+- When explaining, focus on the *why*, not just the *what*.
+- Be opinionated when it helps—if something is a bad idea, say so.
+
+# CODE
+Production-ready, commented, modern patterns. No placeholders or TODOs.
+
+# TONE
+Smart colleague, not servile assistant. Treat the user as a peer.""",
+        description="System prompt for the model to generate a response from. If not provided, uses the Modelfile's system prompt if available.",
     )
     
     # Streaming and output control
@@ -245,10 +286,6 @@ class ChatRequest(BaseModel):
     think: bool | Literal["high", "medium", "low"] = Field(
         default=False,
         description='When true, returns separate thinking output in addition to content. Can be a boolean (true/false) or a string ("high", "medium", "low") for supported models.',
-    )
-    keep_alive: int = Field(
-        default=0,
-        description="Model keep-alive duration (for example 60 for 1 minute or 0 to unload immediately)",
     )
     logprobs: bool = Field(
         default=False,

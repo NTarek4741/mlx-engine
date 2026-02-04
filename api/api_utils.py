@@ -1,5 +1,6 @@
 import mlx as mx
 import gc
+import asyncio
 from mlx_engine.generate import load_model, create_generator, tokenize, load_draft_model
 from transformers import AutoTokenizer, AutoProcessor
 from mlx_engine.model_kit.model_kit import ModelKit
@@ -8,7 +9,7 @@ import json
 from mlx_engine.utils.token import Token
 import re
 from datetime import datetime, timezone
-from api.api_models import GenerateResponse, LogprobEntry, TopLogprobEntry
+from api.api_models import GenerateResponse, ChatResponse, ResponseMessage, LogprobEntry, TopLogprobEntry, Message, Tool
 
 
 
@@ -71,26 +72,26 @@ def load_and_cache_model(model:str, num_ctx:int, kv_bits:int, kv_group_size:int,
     print("✅ Model ready for inference!", end="\n", flush=True)
     return model_kit, load_duration_ns
 
-def prompt_render(raw:bool, images: list[str], prompt: str, system: str, model: str, model_kit: ModelKit, suffix: str):
+def prompt_render(raw:bool, images: list[str], prompt: str, system: str, model: str, suffix: str):
     if not raw:
         if images:
             user_content = []
-            for encoding in images:
-                user_content.append({"type": "image", "image": encoding})
+            for x in range(images):
+                user_content.append({"type": "image", "image": "image"+x})
             user_content.append({"type": "text", "text": prompt})
         else:
             user_content = prompt
 
-        conversation = [
-            {"role": "system", "content": system}, 
-            {"role": "user", "content": user_content}, 
-        ]
+        conversation = []
+        if system:
+            conversation.append({"role": "system", "content": system})
+        conversation.append({"role": "user", "content": user_content})
         
         tf_tokenizer = model_cache["model_kit"].tokenizer._tokenizer
         prompt = tf_tokenizer.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True
         )
-        return tokenize(model_kit, prompt)
+        return tokenize(model_cache["model_kit"], prompt)
     else:
         # Raw mode: Handle FIM or simple concatenation
         if suffix:
@@ -218,46 +219,105 @@ def build_logprobs(tokens: list[Token], top_logprobs: list | None, top_logprobs_
 
 async def generate_stream(generator, model_name: str, stats_collector: GenerationStatsCollector, prompt_tokens: list[int], include_logprobs: bool, top_logprobs: int):
     """
-    Stream generation results as JSON chunks matching Ollama format.
-    Logprobs are included in every chunk when enabled.
+    Stream generation results as JSON chunks matching Ollama /api/generate format.
+    Uses 'response' field for text content.
     """
     generated_token_ids = []
 
-    for generation_result in generator:
-        done = generation_result.stop_condition is not None
-        stats_collector.add_tokens(generation_result.tokens)
+    try:
+        for generation_result in generator:
+            # Check if client disconnected
+            try:
+                await asyncio.sleep(0)  # Yield control to check for cancellation
+            except asyncio.CancelledError:
+                print("Client disconnected, stopping generation")
+                return
 
-        # Collect generated token IDs for context
-        generated_token_ids.extend(token.id for token in generation_result.tokens)
+            done = generation_result.stop_condition is not None
+            stats_collector.add_tokens(generation_result.tokens)
 
-        chunk = {
-            "model": model_name,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "response": generation_result.text,
-            "done": done,
-        }
+            # Collect generated token IDs for context
+            generated_token_ids.extend(token.id for token in generation_result.tokens)
 
-        # Include logprobs in every chunk when enabled
-        if include_logprobs and generation_result.top_logprobs:
-            chunk["logprobs"] = [entry.model_dump() for entry in build_logprobs(generation_result.tokens, generation_result.top_logprobs, top_logprobs)]
+            chunk = {
+                "model": model_name,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "response": generation_result.text,
+                "done": done,
+            }
 
-        if done:
-            chunk["done_reason"] = generation_result.stop_condition.stop_reason
-            # Add timing stats on final chunk
-            end_time = time.time()
-            total_time = end_time - stats_collector.start_time
-            chunk["total_duration"] = int(total_time * 1e9)
-            chunk["load_duration"] = stats_collector.load_duration
-            chunk["prompt_eval_count"] = len(prompt_tokens)
-            chunk["eval_count"] = stats_collector.total_tokens
-            if stats_collector.first_token_time:
-                prompt_time = stats_collector.first_token_time - stats_collector.start_time
-                chunk["prompt_eval_duration"] = int(prompt_time * 1e9)
-                chunk["eval_duration"] = int((total_time - prompt_time) * 1e9)
-            # Add context (prompt + generated tokens) for conversation memory
-            chunk["context"] = prompt_tokens + generated_token_ids
+            # Include logprobs in every chunk when enabled
+            if include_logprobs and generation_result.top_logprobs:
+                chunk["logprobs"] = [entry.model_dump() for entry in build_logprobs(generation_result.tokens, generation_result.top_logprobs, top_logprobs)]
 
-        yield json.dumps(chunk) + "\n"
+            if done:
+                chunk["done_reason"] = generation_result.stop_condition.stop_reason
+                # Add timing stats on final chunk
+                end_time = time.time()
+                total_time = end_time - stats_collector.start_time
+                chunk["total_duration"] = int(total_time * 1e9)
+                chunk["load_duration"] = stats_collector.load_duration
+                chunk["prompt_eval_count"] = len(prompt_tokens)
+                chunk["eval_count"] = stats_collector.total_tokens
+                if stats_collector.first_token_time:
+                    prompt_time = stats_collector.first_token_time - stats_collector.start_time
+                    chunk["prompt_eval_duration"] = int(prompt_time * 1e9)
+                    chunk["eval_duration"] = int((total_time - prompt_time) * 1e9)
+                # Add context (prompt + generated tokens) for conversation memory
+                chunk["context"] = prompt_tokens + generated_token_ids
+
+            yield json.dumps(chunk) + "\n"
+    except asyncio.CancelledError:
+        print("Client disconnected, stopping generation")
+        return
+
+
+async def chat_stream(generator, model_name: str, stats_collector: GenerationStatsCollector, prompt_tokens: list[int], include_logprobs: bool, top_logprobs: int):
+    """
+    Stream chat results as JSON chunks matching Ollama /api/chat format.
+    Uses ChatResponse model for consistent formatting.
+    """
+    try:
+        for generation_result in generator:
+            # Check if client disconnected
+            try:
+                await asyncio.sleep(0)  # Yield control to check for cancellation
+            except asyncio.CancelledError:
+                print("Client disconnected, stopping generation")
+                return
+
+            done = generation_result.stop_condition is not None
+            stats_collector.add_tokens(generation_result.tokens)
+
+            response = ChatResponse(
+                model=model_name,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                message=ResponseMessage(role="assistant", content=generation_result.text),
+                done=done,
+            )
+
+            # Add logprobs if enabled
+            if include_logprobs and generation_result.top_logprobs:
+                response.logprobs = build_logprobs(generation_result.tokens, generation_result.top_logprobs, top_logprobs)
+
+            # Add stats on final chunk
+            if done:
+                response.done_reason = generation_result.stop_condition.stop_reason
+                end_time = time.time()
+                total_time = end_time - stats_collector.start_time
+                response.total_duration = int(total_time * 1e9)
+                response.load_duration = stats_collector.load_duration
+                response.prompt_eval_count = len(prompt_tokens)
+                response.eval_count = stats_collector.total_tokens
+                if stats_collector.first_token_time:
+                    prompt_time = stats_collector.first_token_time - stats_collector.start_time
+                    response.prompt_eval_duration = int(prompt_time * 1e9)
+                    response.eval_duration = int((total_time - prompt_time) * 1e9)
+
+            yield response.model_dump_json() + "\n"
+    except asyncio.CancelledError:
+        print("Client disconnected, stopping generation")
+        return
 
 
 async def generate_output(
@@ -301,9 +361,9 @@ async def generate_output(
     finish_reason = "length"
     if generation_result and generation_result.stop_condition:
         if generation_result.stop_condition.stop_reason == "stop_string":
-            finish_reason = "stop_string"
+            finish_reason = "stop"
         elif generation_result.stop_condition.stop_reason == "end_token":
-            finish_reason = "end_token"
+            finish_reason = "end"
     
     # Calculate timing in nanoseconds
     end_time = time.time()
@@ -337,3 +397,28 @@ async def generate_output(
             logprobs = final_logprobs,
             context = prompt_tokens + generated_token_ids,
             )
+
+async def chat_render(messages: list[Message], tools: list[Tool] | None, images: list[str]):
+    tf_tokenizer = model_cache["model_kit"].tokenizer._tokenizer
+
+    # Convert Pydantic models to dicts and collect images
+    messages_dicts = []
+    for msg in messages:
+        if msg.images:
+            # Build content with image placeholders first, then text
+            content = []
+            for i in range(len(msg.images)):
+                content.append({"type": "image", "image": "image" + str(len(images) + i)})
+            content.append({"type": "text", "text": msg.content})
+            images.extend(msg.images)
+            messages_dicts.append({"role": msg.role, "content": content})
+        else:
+            # No images - content is just a string
+            messages_dicts.append({"role": msg.role, "content": msg.content})
+
+    tools_dicts = [tool.model_dump(exclude_none=True) for tool in tools] if tools else None
+
+    prompt = tf_tokenizer.apply_chat_template(
+        messages_dicts, tools=tools_dicts, tokenize=False, add_generation_prompt=True
+    )
+    return tokenize(model_cache["model_kit"], prompt)
