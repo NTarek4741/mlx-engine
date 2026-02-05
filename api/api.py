@@ -1,3 +1,4 @@
+from starlette.responses import StreamingResponse
 from typing import Annotated
 
 import os
@@ -29,6 +30,14 @@ from api.api_models import (
     PSResponse,
     RunningModelInfo,
 )
+
+# Anthropic API imports
+from anthropic.anthropic import messages as anthropic_messages
+from anthropic.anthropic_models import MessagesParams
+
+# OpenAI API imports
+from openai.openai import chat_completions as openai_chat_completions
+from openai.openai_models import ChatCompletionRequest, ModelsListResponse, ModelObject
 
 # Import utility functions
 from api.api_utils import (
@@ -168,9 +177,65 @@ async def embeddings():
     """Generate embeddings"""
     return {"embeddings": []}
 
- 
+
+# =============================================================================
+# Anthropic API Endpoint
+# =============================================================================
+
+@app.post("/v1/messages")
+async def messages(params: Annotated[MessagesParams, Body]):
+    """
+    Anthropic Messages API endpoint.
+
+    Handles both streaming and non-streaming responses in Anthropic format.
+    """
+    return await anthropic_messages(params)
 
 
+# =============================================================================
+# OpenAI API Endpoints
+# =============================================================================
+
+@app.post("/v1/chat/completions")
+async def chat_completions(params: Annotated[ChatCompletionRequest, Body]):
+    """
+    OpenAI-compatible chat completions endpoint.
+
+    Handles both streaming and non-streaming responses in OpenAI format.
+    """
+    return await openai_chat_completions(params)
+
+
+@app.get("/v1/models")
+async def list_openai_models() -> ModelsListResponse:
+    """
+    OpenAI-compatible models list endpoint.
+
+    Returns list of available models in OpenAI format.
+    """
+    models = []
+    models_dir = "./models"
+
+    for org in os.listdir(models_dir):
+        org_path = os.path.join(models_dir, org)
+        if not os.path.isdir(org_path):
+            continue
+
+        for model_name in os.listdir(org_path):
+            model_path = os.path.join(org_path, model_name)
+            if not os.path.isdir(model_path):
+                continue
+
+            full_name = f"{org}/{model_name}"
+            model_info = ModelObject(
+                id=full_name,
+                created=int(os.path.getmtime(model_path)),
+                owned_by=org,
+            )
+            models.append(model_info)
+
+    models.sort(key=lambda m: m.id)
+    return ModelsListResponse(data=models)
 
 
 #Conveniant Endpoints ____________________

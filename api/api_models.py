@@ -19,7 +19,7 @@ class PSResponse(BaseModel):
     """Response body for the /api/ps endpoint."""
     models: list[RunningModelInfo] = Field(description="List of currently running models")
 
-
+#----------------------------------------------------------------------------------------
 class GenerationOptions(BaseModel):
     """Runtime options that control text generation."""
 
@@ -211,6 +211,7 @@ class GenerateResponse(BaseModel):
         description="An encoding of the conversation used in this response, can be sent in the next request to keep conversational memory",
     )
 
+#----------------------------------------------------------------------------------------
 
 # Chat Request Models
 
