@@ -93,6 +93,7 @@ class FunctionCall(BaseModel):
 class ToolCall(BaseModel):
     """Tool call made by the model."""
     id: str = Field(description="Unique ID for this tool call")
+    index: int = Field(default=0, description="Index of this tool call")
     type: Literal["function"] = "function"
     function: FunctionCall
 
@@ -106,21 +107,18 @@ class SystemMessage(BaseModel):
     """System message."""
     role: Literal["system"]
     content: str
-    name: str | None = None
 
 
 class UserMessage(BaseModel):
     """User message with text or multimodal content."""
     role: Literal["user"]
     content: str | list[ContentPart]
-    name: str | None = None
 
 
 class AssistantMessage(BaseModel):
     """Assistant message, possibly with tool calls."""
     role: Literal["assistant"]
     content: str | None = None
-    name: str | None = None
     tool_calls: list[ToolCall] | None = None
 
 
@@ -214,10 +212,6 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate"
     )
-    max_completion_tokens: int | None = Field(
-        default=None,
-        description="Max tokens for completion (preferred over max_tokens)"
-    )
 
     # Streaming
     stream: bool | None = Field(
@@ -308,9 +302,10 @@ class ChatCompletionResponse(BaseModel):
 
 class DeltaMessage(BaseModel):
     """Delta content in a streaming chunk."""
-    role: Literal["assistant"] | None = None
-    content: str | None = None
+    role: Literal["assistant"]
+    content: str = ""
     tool_calls: list[ToolCall] | None = None
+    reasoning: str | None = None
 
 
 class ChunkChoice(BaseModel):

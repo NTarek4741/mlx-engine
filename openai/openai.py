@@ -9,11 +9,13 @@ from openai.openai_models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+import json
 from api.api_utils import load_and_cache_model, GenerationStatsCollector, model_cache
 from openai.openai_utils import (
     convert_openai_messages,
     build_openai_response,
     openai_stream,
+    parse_tool_calls,
 )
 
 
@@ -52,10 +54,6 @@ async def chat_completions(params: ChatCompletionRequest) -> ChatCompletionRespo
         StreamingResponse (SSE) if stream=True:
             Yields chunks with delta content.
     """
-    print()
-    # Determine max tokens
-    max_tokens = params.max_completion_tokens or params.max_tokens
-
     # 1. Load model using shared utility
     model_kit, load_duration_ns = load_and_cache_model(
         model=params.model,
@@ -95,7 +93,6 @@ async def chat_completions(params: ChatCompletionRequest) -> ChatCompletionRespo
         elif params.response_format.type == "json_schema":
             # Structured output with schema
             if params.response_format.json_schema and params.response_format.json_schema.schema_:
-                import json
                 json_schema = json.dumps(params.response_format.json_schema.schema_)
 
     # 6. Normalize stop sequences
@@ -112,7 +109,7 @@ async def chat_completions(params: ChatCompletionRequest) -> ChatCompletionRespo
         prompt_tokens,
         images_b64=images_b64 if images_b64 else None,
         stop_strings=stop_sequences,
-        max_tokens=max_tokens,
+        max_tokens=params.max_tokens,
         top_logprobs=None,
         prompt_progress_reporter=None,
         seed=params.seed,
@@ -179,11 +176,16 @@ async def generate_openai_output(
         if stop_reason in ("stop_string", "eos_token"):
             finish_reason = "stop"
 
+    # Parse tool calls from generated text
+    tool_calls, remaining_content = parse_tool_calls(result_text)
+    if tool_calls:
+        finish_reason = "tool_calls"
+
     return build_openai_response(
         model=params.model,
-        result_text=result_text,
+        result_text=remaining_content,
         finish_reason=finish_reason,
         prompt_token_count=prompt_token_count,
         completion_token_count=stats_collector.total_tokens,
-        tool_calls=None,  # TODO: Parse tool calls from output if applicable
+        tool_calls=tool_calls,
     )

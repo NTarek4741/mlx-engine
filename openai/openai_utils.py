@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -47,6 +48,73 @@ def image_url_to_base64(url: str) -> str:
     with urlopen(url) as response:
         image_data = response.read()
     return base64.b64encode(image_data).decode("utf-8")
+
+
+def parse_tool_calls(text: str) -> tuple[list[ToolCall] | None, str | None]:
+    """
+    Parse tool calls from model-generated text.
+    Supports multiple formats:
+    - <tool_call>{"name":"...","arguments":{...}}</tool_call> (Qwen/Hermes)
+    - [TOOL_CALLS]name[ARGS]{"key":"value"} (Mistral)
+
+    Returns:
+        (tool_calls, remaining_content) where:
+        - tool_calls: list of ToolCall objects if found, else None
+        - remaining_content: text outside tool call tags, or None if empty
+    """
+    tool_calls = []
+    remaining = text
+
+    # Format 1: Mistral — [TOOL_CALLS]funcName[ARGS]{...}
+    mistral_pattern = r'\[TOOL_CALLS\]\s*(\w+)\s*\[ARGS\]\s*(\{.*?\})'
+    mistral_matches = re.findall(mistral_pattern, text, re.DOTALL)
+    if mistral_matches:
+        for i, (name, args_str) in enumerate(mistral_matches):
+            try:
+                parsed_args = json.loads(args_str)
+            except json.JSONDecodeError:
+                parsed_args = {}
+            arguments = json.dumps(parsed_args) if isinstance(parsed_args, dict) else args_str
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            tool_calls.append(ToolCall(
+                id=call_id,
+                index=i,
+                type="function",
+                function=FunctionCall(name=name, arguments=arguments),
+            ))
+        remaining = re.sub(mistral_pattern, '', text, flags=re.DOTALL).strip()
+
+    # Format 2: Qwen/Hermes — <tool_call>...</tool_call>
+    if not tool_calls:
+        xml_pattern = r'<tool_call>\s*(.*?)\s*</tool_call>'
+        xml_matches = re.findall(xml_pattern, text, re.DOTALL)
+        if xml_matches:
+            for i, match in enumerate(xml_matches):
+                try:
+                    parsed = json.loads(match)
+                except json.JSONDecodeError:
+                    continue
+                if "function" in parsed:
+                    name = parsed["function"].get("name", "")
+                    arguments = parsed["function"].get("arguments", {})
+                else:
+                    name = parsed.get("name", "")
+                    arguments = parsed.get("arguments", parsed.get("parameters", {}))
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments)
+                call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_calls.append(ToolCall(
+                    id=call_id,
+                    index=i,
+                    type="function",
+                    function=FunctionCall(name=name, arguments=arguments),
+                ))
+            remaining = re.sub(xml_pattern, '', text, flags=re.DOTALL).strip()
+
+    if not tool_calls:
+        return None, text
+
+    return tool_calls, remaining if remaining else None
 
 
 def convert_openai_messages(
@@ -168,7 +236,7 @@ def build_openai_response(
     prompt_token_count: int,
     completion_token_count: int,
     tool_calls: list[ToolCall] | None = None,
-) -> ChatCompletionResponse:
+) -> dict:
     """
     Build OpenAI ChatCompletionResponse from generation results.
 
@@ -185,7 +253,7 @@ def build_openai_response(
     """
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
-    return ChatCompletionResponse(
+    response = ChatCompletionResponse(
         id=response_id,
         created=int(time.time()),
         model=model,
@@ -206,7 +274,10 @@ def build_openai_response(
             total_tokens=prompt_token_count + completion_token_count,
         ),
     )
+    return json.loads(response.model_dump_json(exclude_none=True))
 
+
+TOOL_CALL_PREFIXES = ("[TOOL_CALLS]", "<tool_call>")
 
 async def openai_stream(
     generator,
@@ -218,11 +289,8 @@ async def openai_stream(
     """
     Stream generation results in OpenAI SSE format.
 
-    Yields SSE data lines in the format:
-    data: {"id":"...","object":"chat.completion.chunk",...}
-
-    Final line is:
-    data: [DONE]
+    Streams tokens in real-time. If the first tokens indicate a tool call,
+    switches to buffering mode and emits structured tool_calls at the end.
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -240,35 +308,66 @@ async def openai_stream(
             )
         ],
     )
-    yield f"data: {first_chunk.model_dump_json()}\n\n"
+    yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Content chunks
+    full_text = ""
+    think = ""
+    thinking = False
+    buffering = None  # None = undecided, True = buffer for tool calls, False = stream normally
+    pending_chunks = []  # tokens held while deciding
     finish_reason = None
+
     try:
         for generation_result in generator:
-            # Check if client disconnected
             try:
                 await asyncio.sleep(0)
             except asyncio.CancelledError:
-                print("Client disconnected, stopping generation")
                 return
 
             stats_collector.add_tokens(generation_result.tokens)
 
             if generation_result.text:
-                content_chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model_name,
-                    choices=[
-                        ChunkChoice(
-                            index=0,
-                            delta=DeltaMessage(content=generation_result.text),
-                            finish_reason=None,
-                        )
-                    ],
-                )
-                yield f"data: {content_chunk.model_dump_json()}\n\n"
+                if generation_result.text == '<think>':
+                    thinking = True
+                if generation_result.text == '</think>':
+                    think += generation_result.text
+                    thinking = False
+                    continue
+                if thinking == True:
+                    think += generation_result.text
+                    continue
+                
+                full_text += generation_result.text
+
+                if buffering is None:
+                    # Still deciding — check if text starts with a tool call prefix
+                    pending_chunks.append(generation_result.text)
+                    print(len(full_text))
+                    print(full_text)
+                    v = [p in full_text for p in TOOL_CALL_PREFIXES]
+                    print(v)
+                    if any(v):
+                        buffering = True
+                        print("Hello")
+                    elif len(full_text) >= 15:
+                        # Enough text to decide — not a tool call, flush and stream
+                        print("GoodBye")
+                        buffering = False
+                        for chunk_text in pending_chunks:
+                            content_chunk = ChatCompletionChunk(
+                                id=chunk_id, created=created, model=model_name,
+                                choices=[ChunkChoice(index=0, delta=DeltaMessage(content=chunk_text))],
+                            )
+                            yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+                        pending_chunks.clear()
+                elif buffering is False:
+                    # Streaming mode — emit token immediately
+                    content_chunk = ChatCompletionChunk(
+                        id=chunk_id, created=created, model=model_name,
+                        choices=[ChunkChoice(index=0, delta=DeltaMessage(content=generation_result.text))],
+                    )
+                    yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+                # buffering is True — just accumulate
 
             if generation_result.stop_condition:
                 stop_reason = generation_result.stop_condition.stop_reason
@@ -281,8 +380,44 @@ async def openai_stream(
                 break
 
     except asyncio.CancelledError:
-        print("Client disconnected, stopping generation")
         return
+
+    # If we never decided (very short output), flush pending as content
+    if buffering is None:
+        buffering = any(full_text.startswith(p) for p in TOOL_CALL_PREFIXES)
+        if not buffering:
+            for chunk_text in pending_chunks:
+                content_chunk = ChatCompletionChunk(
+                    id=chunk_id, created=created, model=model_name,
+                    choices=[ChunkChoice(index=0, delta=DeltaMessage(content=chunk_text))],
+                )
+                yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    # If buffering, parse tool calls and emit them
+    if buffering:
+        tool_calls, remaining_content = parse_tool_calls(full_text)
+        if tool_calls:
+            if remaining_content:
+                content_chunk = ChatCompletionChunk(
+                    id=chunk_id, created=created, model=model_name,
+                    choices=[ChunkChoice(index=0, delta=DeltaMessage(content=remaining_content))],
+                )
+                yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+            tool_call_chunk = ChatCompletionChunk(
+                id=chunk_id, created=created, model=model_name,
+                choices=[ChunkChoice(index=0, delta=DeltaMessage(tool_calls=tool_calls))],
+            )
+            yield f"data: {tool_call_chunk.model_dump_json(exclude_none=True)}\n\n"
+            finish_reason = "tool_calls"
+        else:
+            # Looked like tool call but wasn't — flush as content
+            if full_text:
+                content_chunk = ChatCompletionChunk(
+                    id=chunk_id, created=created, model=model_name,
+                    choices=[ChunkChoice(index=0, delta=DeltaMessage(content=full_text))],
+                )
+                yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Final chunk with finish_reason
     final_chunk = ChatCompletionChunk(
@@ -302,7 +437,5 @@ async def openai_stream(
             total_tokens=len(prompt_tokens) + stats_collector.total_tokens,
         ) if include_usage else None,
     )
-    yield f"data: {final_chunk.model_dump_json()}\n\n"
-
-    # Done signal
+    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
     yield "data: [DONE]\n\n"
