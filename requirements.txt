@@ -22,7 +22,7 @@ annotated-types==0.7.0
     #   pydantic
 antlr4-python3-runtime==4.9.3
     # via omegaconf
-anyio==4.12.0
+anyio==4.12.1
     # via
     #   mlx-engine (pyproject.toml)
     #   httpx
@@ -43,7 +43,7 @@ catalogue==2.0.10
     #   spacy
     #   srsly
     #   thinc
-certifi==2025.11.12
+certifi==2026.1.4
     # via
     #   mlx-engine (pyproject.toml)
     #   httpcore
@@ -88,7 +88,7 @@ dacite==1.9.2
     # via mlx-audio
 datasets==4.5.0
     # via mlx-vlm
-dill==0.4.0
+dill==0.4.1
     # via
     #   mlx-engine (pyproject.toml)
     #   datasets
@@ -109,7 +109,7 @@ espeakng-loader==0.2.4
     # via
     #   misaki
     #   mlx-audio
-fastapi==0.128.0
+fastapi==0.128.1
     # via
     #   mlx-engine (pyproject.toml)
     #   mlx-audio
@@ -157,7 +157,7 @@ httpx==0.28.1
     #   mlx-engine (pyproject.toml)
     #   datasets
     #   huggingface-hub
-huggingface-hub==1.2.2
+huggingface-hub==1.4.0
     # via
     #   mlx-engine (pyproject.toml)
     #   datasets
@@ -197,7 +197,7 @@ jsonpath-ng==1.7.0
     # via
     #   mlx-engine (pyproject.toml)
     #   outlines
-jsonschema==4.25.1
+jsonschema==4.26.0
     # via
     #   mlx-engine (pyproject.toml)
     #   csvw
@@ -226,7 +226,7 @@ misaki==0.9.4
     # via mlx-audio
 mistral-common==1.8.8
     # via mlx-audio
-mlx==0.30.0
+mlx==0.30.5
     # via
     #   mlx-engine (pyproject.toml)
     #   mlx-audio
@@ -234,15 +234,15 @@ mlx==0.30.0
     #   mlx-vlm
 mlx-audio==0.2.7
     # via mlx-engine (pyproject.toml)
-mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@f3ed856610d3852e41d691b8968021040f9c4a6b
+mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@b7cc3aa
     # via
     #   mlx-engine (pyproject.toml)
     #   mlx-vlm
-mlx-metal==0.30.0
+mlx-metal==0.30.5
     # via
     #   mlx-engine (pyproject.toml)
     #   mlx
-mlx-vlm==0.3.9
+mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@5812270
     # via
     #   mlx-engine (pyproject.toml)
     #   mlx-audio
@@ -298,7 +298,7 @@ outlines-core==0.1.26
     # via
     #   mlx-engine (pyproject.toml)
     #   outlines
-packaging==25.0
+packaging==26.0
     # via
     #   mlx-engine (pyproject.toml)
     #   datasets
@@ -314,7 +314,7 @@ phonemizer-fork==3.3.2
     # via
     #   misaki
     #   mlx-audio
-pillow==12.0.0
+pillow==12.1.0
     # via
     #   mlx-engine (pyproject.toml)
     #   mistral-common
@@ -337,7 +337,7 @@ propcache==0.4.1
     # via
     #   aiohttp
     #   yarl
-protobuf==6.33.2
+protobuf==6.33.5
     # via
     #   mlx-engine (pyproject.toml)
     #   mlx-lm
@@ -399,7 +399,7 @@ referencing==0.37.0
     #   jsonschema
     #   jsonschema-specifications
     #   outlines
-regex==2025.11.3
+regex==2026.1.15
     # via
     #   mlx-engine (pyproject.toml)
     #   curated-tokenizers
@@ -499,7 +499,7 @@ tiktoken==0.12.0
     # via
     #   mistral-common
     #   mlx-audio
-tokenizers==0.22.1
+tokenizers==0.22.2
     # via
     #   mlx-engine (pyproject.toml)
     #   transformers
@@ -511,7 +511,7 @@ torch==2.9.0
     #   torchvision
 torchvision==0.24.0
     # via mlx-engine (pyproject.toml)
-tqdm==4.67.1
+tqdm==4.67.3
     # via
     #   mlx-engine (pyproject.toml)
     #   datasets
@@ -521,15 +521,15 @@ tqdm==4.67.1
     #   outlines
     #   spacy
     #   transformers
-transformers==5.0.0rc1
+transformers==5.0.0
     # via
     #   mlx-engine (pyproject.toml)
     #   mlx-audio
     #   mlx-lm
     #   mlx-vlm
-typer==0.20.0
+typer==0.21.1
     # via mlx-engine (pyproject.toml)
-typer-slim==0.20.0
+typer-slim==0.21.1
     # via
     #   huggingface-hub
     #   spacy
@@ -555,7 +555,7 @@ typing-inspection==0.4.2
     #   pydantic
 uritemplate==4.2.0
     # via csvw
-urllib3==2.6.2
+urllib3==2.6.3
     # via
     #   mlx-engine (pyproject.toml)
     #   requests
