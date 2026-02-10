@@ -27,20 +27,19 @@ import logging
 from api.api_models import (
     GenerateRequest,
     ChatRequest,
+    ChatCompletionRequest,
     GenerationOptions,
     TagsResponse,
     ModelInfo,
     PSResponse,
     RunningModelInfo,
+    ModelsListResponse,
+    ModelObject,
 )
 
 # Anthropic API imports
 from anthropic.anthropic import messages as anthropic_messages
 from anthropic.anthropic_models import MessagesParams
-
-# OpenAI API imports
-from openai.openai import chat_completions as openai_chat_completions
-from openai.openai_models import ChatCompletionRequest, ModelsListResponse, ModelObject
 
 # Import utility functions
 from api.api_utils import (
@@ -51,7 +50,10 @@ from api.api_utils import (
     chat_stream,
     generate_output,
     chat_render,
-    model_cache
+    model_cache,
+    openai_to_chat_convert,
+    openai_stream,
+    generate_openai_output,
 )
 
 # Import API examples
@@ -365,11 +367,32 @@ async def chat_completions(
             usage statistics, and finish reason.
     """
     print(params)
-    try:
-        return await openai_chat_completions(params)
-    except Exception as e:
-        logger.info(f"Error processing OpenAI chat completions request: {str(e)}")
-        return {"error": f"Error processing chat completions request: {str(e)}"}
+    request = openai_to_chat_convert(params)
+    generator, stats_collector, prompt_tokens = await engine_core(request.options, params.model, request)
+
+       # 8. Return streaming or non-streaming response
+    if params.stream:
+        include_usage = False
+        if params.stream_options and params.stream_options.include_usage:
+            include_usage = True
+
+        return StreamingResponse(
+            openai_stream(
+                generator,
+                params.model,
+                stats_collector,
+                prompt_tokens,
+                include_usage,
+            ),
+            media_type="text/event-stream",
+        )
+    else:
+        return await generate_openai_output(
+            generator,
+            stats_collector,
+            params,
+            len(prompt_tokens),
+        )
 
 
 # =============================================================================
