@@ -99,6 +99,7 @@ def load_and_cache_model(model:str, num_ctx:int, kv_bits:int, kv_group_size:int,
     model_kit = load_model(
         load_params["model_path"],
         max_kv_size=load_params["max_kv_size"],
+        max_seq_nums=1,
         trust_remote_code=False,
         kv_bits=load_params["kv_bits"],
         kv_group_size=load_params["kv_group_size"],
@@ -615,9 +616,12 @@ def parse_tool_calls(text: str) -> tuple[list[OpenAIToolCall] | None, str | None
     tool_calls = []
     remaining = text
 
+    # Clean BPE space markers (U+0120 'Ġ') that some tokenizers emit
+    cleaned_text = text.replace('\u0120', ' ')
+
     # Format 1: Mistral — [TOOL_CALLS]funcName[ARGS]{...}
     mistral_pattern = r'\[TOOL_CALLS\]\s*(\w+)\s*\[ARGS\]\s*(\{.*?\})'
-    mistral_matches = re.findall(mistral_pattern, text, re.DOTALL)
+    mistral_matches = re.findall(mistral_pattern, cleaned_text, re.DOTALL)
     if mistral_matches:
         for i, (name, args_str) in enumerate(mistral_matches):
             try:
@@ -632,12 +636,12 @@ def parse_tool_calls(text: str) -> tuple[list[OpenAIToolCall] | None, str | None
                 type="function",
                 function=OpenAIFunctionCall(name=name, arguments=arguments),
             ))
-        remaining = re.sub(mistral_pattern, '', text, flags=re.DOTALL).strip()
+        remaining = re.sub(mistral_pattern, '', cleaned_text, flags=re.DOTALL).strip()
 
     # Format 2: Qwen/Hermes — <tool_call>...</tool_call>
     if not tool_calls:
         xml_pattern = r'<tool_call>\s*(.*?)\s*</tool_call>'
-        xml_matches = re.findall(xml_pattern, text, re.DOTALL)
+        xml_matches = re.findall(xml_pattern, cleaned_text, re.DOTALL)
         if xml_matches:
             for i, match in enumerate(xml_matches):
                 try:
@@ -659,7 +663,7 @@ def parse_tool_calls(text: str) -> tuple[list[OpenAIToolCall] | None, str | None
                     type="function",
                     function=OpenAIFunctionCall(name=name, arguments=arguments),
                 ))
-            remaining = re.sub(xml_pattern, '', text, flags=re.DOTALL).strip()
+            remaining = re.sub(xml_pattern, '', cleaned_text, flags=re.DOTALL).strip()
 
     if not tool_calls:
         return None, text
