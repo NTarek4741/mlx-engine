@@ -53,8 +53,10 @@ from api.api_models import (
     ToolUseBlockParam,
     ToolResultBlockParam,
     AnthropicTool,
-    AnthropicChatCompletionResponse,
-    AnthropicChoice,
+    AnthropicMessageResponse,
+    AnthropicTextBlock,
+    AnthropicToolUseBlock,
+    AnthropicThinkingBlock,
     AnthropicUsage,
     MessagesParams,
 )
@@ -176,7 +178,7 @@ def prompt_render(raw:bool, images: list[str], prompt: str, system: str, model: 
             # No suffix, simple concatenation
             raw_prompt = f"{system + chr(10) if system else ''}{prompt}"
 
-        return tokenize(model_kit, raw_prompt)
+        return tokenize(model_cache["model_kit"], raw_prompt)
 
 
 class GenerationStatsCollector:
@@ -784,6 +786,7 @@ def build_openai_response(
     prompt_token_count: int,
     completion_token_count: int,
     tool_calls: list[OpenAIToolCall] | None = None,
+    reasoning_content: str | None = None,
 ) -> dict:
     """
     Build OpenAI ChatCompletionResponse from generation results.
@@ -800,6 +803,7 @@ def build_openai_response(
                 message=OpenAIResponseMessage(
                     role="assistant",
                     content=result_text if result_text else None,
+                    reasoning_content=reasoning_content,
                     tool_calls=tool_calls,
                 ),
                 finish_reason=finish_reason,
@@ -848,7 +852,6 @@ async def openai_stream(
     yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     full_text = ""
-    think = ""
     thinking = False
     buffering = None  # None = undecided, True = buffer for tool calls, False = stream normally
     pending_chunks = []  # tokens held while deciding
@@ -864,14 +867,19 @@ async def openai_stream(
             stats_collector.add_tokens(generation_result.tokens)
 
             if generation_result.text:
+                # Handle thinking blocks — stream as reasoning_content
                 if generation_result.text == '<think>':
                     thinking = True
+                    continue
                 if generation_result.text == '</think>':
-                    think += generation_result.text
                     thinking = False
                     continue
-                if thinking == True:
-                    think += generation_result.text
+                if thinking:
+                    reasoning_chunk = ChatCompletionChunk(
+                        id=chunk_id, created=created, model=model_name,
+                        choices=[ChunkChoice(index=0, delta=DeltaMessage(reasoning_content=generation_result.text))],
+                    )
+                    yield f"data: {reasoning_chunk.model_dump_json(exclude_none=True)}\n\n"
                     continue
 
                 full_text += generation_result.text
@@ -879,16 +887,10 @@ async def openai_stream(
                 if buffering is None:
                     # Still deciding — check if text starts with a tool call prefix
                     pending_chunks.append(generation_result.text)
-                    print(len(full_text))
-                    print(full_text)
-                    v = [p in full_text for p in TOOL_CALL_PREFIXES]
-                    print(v)
-                    if any(v):
+                    if any(p in full_text for p in TOOL_CALL_PREFIXES):
                         buffering = True
-                        print("Hello")
                     elif len(full_text) >= 15:
                         # Enough text to decide — not a tool call, flush and stream
-                        print("GoodBye")
                         buffering = False
                         for chunk_text in pending_chunks:
                             content_chunk = ChatCompletionChunk(
@@ -986,6 +988,7 @@ async def generate_openai_output(
 ) -> ChatCompletionResponse:
     """
     Collect full generation output and return OpenAI response.
+    Extracts thinking blocks as reasoning_content.
     """
     result_text = ""
     generation_result = None
@@ -993,6 +996,13 @@ async def generate_openai_output(
     for generation_result in generator:
         result_text += generation_result.text
         stats_collector.add_tokens(generation_result.tokens)
+
+    # Extract thinking blocks as reasoning_content
+    reasoning_content = None
+    think_matches = re.findall(r'<think>(.*?)</think>', result_text, flags=re.DOTALL)
+    if think_matches:
+        reasoning_content = "\n".join(m.strip() for m in think_matches)
+        result_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
 
     # Determine finish reason
     finish_reason = "length"
@@ -1013,6 +1023,7 @@ async def generate_openai_output(
         prompt_token_count=prompt_token_count,
         completion_token_count=stats_collector.total_tokens,
         tool_calls=tool_calls,
+        reasoning_content=reasoning_content,
     )
 
 
@@ -1170,40 +1181,51 @@ def anthropic_to_chat_convert(params: MessagesParams) -> ChatRequest:
 
 def build_anthropic_response(
     model: str,
-    result_text: str,
-    finish_reason: str,
+    result_text: str | None,
+    stop_reason: str,
     prompt_token_count: int,
     completion_token_count: int,
-    tokens_per_second: float | None,
-    logprobs: list | None = None
-) -> AnthropicChatCompletionResponse:
+    tool_calls: list[OpenAIToolCall] | None = None,
+    thinking_text: str | None = None,
+) -> dict:
     """
-    Build Anthropic ChatCompletionResponse from generation results.
+    Build native Anthropic Message response from generation results.
     """
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-    return AnthropicChatCompletionResponse(
-        id=response_id,
-        created=int(time.time()),
+    content: list[AnthropicThinkingBlock | AnthropicTextBlock | AnthropicToolUseBlock] = []
+    if thinking_text:
+        content.append(AnthropicThinkingBlock(type="thinking", thinking=thinking_text))
+    if result_text:
+        content.append(AnthropicTextBlock(type="text", text=result_text))
+    if tool_calls:
+        for tc in tool_calls:
+            args = tc.function.arguments
+            if isinstance(args, str):
+                args = json.loads(args)
+            content.append(AnthropicToolUseBlock(
+                type="tool_use",
+                id=tc.id,
+                name=tc.function.name,
+                input=args,
+            ))
+    if not content:
+        content.append(AnthropicTextBlock(type="text", text=""))
+
+    response = AnthropicMessageResponse(
+        id=message_id,
+        type="message",
+        role="assistant",
+        content=content,
         model=model,
-        choices=[
-            AnthropicChoice(
-                index=0,
-                message=MessageParam(
-                    role="assistant",
-                    content=[TextBlockParam(type="text", text=result_text)]
-                ),
-                finish_reason=finish_reason,
-                logprobs=logprobs,
-            )
-        ],
+        stop_reason=stop_reason,
+        stop_sequence=None,
         usage=AnthropicUsage(
-            prompt_tokens=prompt_token_count,
-            completion_tokens=completion_token_count,
-            total_tokens=prompt_token_count + completion_token_count,
-            tokens_per_second=tokens_per_second,
+            input_tokens=prompt_token_count,
+            output_tokens=completion_token_count,
         ),
     )
+    return json.loads(response.model_dump_json(exclude_none=True))
 
 
 async def anthropic_stream(
@@ -1216,14 +1238,16 @@ async def anthropic_stream(
 ) -> AsyncGenerator[str, None]:
     """
     Stream generation results in Anthropic SSE format.
+    Emits thinking blocks as {"type": "thinking"} content blocks (like real API),
+    then text blocks, then tool_use blocks if detected.
 
-    Yields SSE events with format:
-    - event: message_start
-    - event: content_block_start
-    - event: content_block_delta (text chunks)
-    - event: content_block_stop
-    - event: message_delta (usage stats)
-    - event: message_stop
+    Event sequence:
+    - message_start
+    - [if thinking:] content_block_start(thinking) -> thinking_deltas -> content_block_stop
+    - content_block_start(text) -> text_deltas -> content_block_stop
+    - [if tool calls:] content_block_start(tool_use) -> input_json_delta -> content_block_stop
+    - message_delta (stop_reason + usage)
+    - message_stop
     """
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -1246,77 +1270,153 @@ async def anthropic_stream(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # 2. content_block_start event
-    content_block_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {
-            "type": "text",
-            "text": ""
-        }
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
-
-    # 3. Stream content deltas
+    # Track state
+    block_index = 0          # next content block index to emit
+    thinking = False         # inside <think> block
+    thinking_started = False # whether we've emitted a thinking content_block_start
+    text_started = False     # whether we've emitted a text content_block_start
+    text_block_index = -1    # index of the text block (set when emitted)
+    full_text = ""
+    buffering = None         # None = undecided, True = buffer for tool calls, False = stream
+    pending_chunks = []
     stop_reason = None
+
     try:
         for generation_result in generator:
-            # Check if client disconnected
             try:
                 await asyncio.sleep(0)
             except asyncio.CancelledError:
-                print("Client disconnected, stopping generation")
                 return
 
             stats_collector.add_tokens(generation_result.tokens)
 
             if generation_result.text:
-                delta_event = {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": generation_result.text
-                    }
-                }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                # --- Thinking block handling ---
+                if generation_result.text == '<think>':
+                    thinking = True
+                    if not thinking_started:
+                        # Emit thinking content_block_start
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                        thinking_started = True
+                    continue
+                if generation_result.text == '</think>':
+                    thinking = False
+                    if thinking_started:
+                        # Close thinking block
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                        block_index += 1
+                        thinking_started = False
+                    continue
+                if thinking:
+                    # Stream as thinking_delta
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': generation_result.text}})}\n\n"
+                    continue
+
+                # --- Normal text handling (with tool call buffering) ---
+                full_text += generation_result.text
+
+                if buffering is None:
+                    pending_chunks.append(generation_result.text)
+                    if any(p in full_text for p in TOOL_CALL_PREFIXES):
+                        buffering = True
+                    elif len(full_text) >= 15:
+                        buffering = False
+                        # Start text block and flush pending
+                        if not text_started:
+                            text_block_index = block_index
+                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            text_started = True
+                            block_index += 1
+                        for chunk_text in pending_chunks:
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': chunk_text}})}\n\n"
+                        pending_chunks.clear()
+                elif buffering is False:
+                    if not text_started:
+                        text_block_index = block_index
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                        text_started = True
+                        block_index += 1
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': generation_result.text}})}\n\n"
+                # buffering is True — just accumulate
 
             if generation_result.stop_condition:
-                stop_reason = generation_result.stop_condition.stop_reason
-                if stop_reason in ("stop_string", "eos_token"):
+                sr = generation_result.stop_condition.stop_reason
+                if sr in ("stop_string", "eos_token"):
                     stop_reason = "end_turn"
-                elif stop_reason == "max_tokens":
+                elif sr == "max_tokens":
                     stop_reason = "max_tokens"
                 break
     except asyncio.CancelledError:
-        print("Client disconnected, stopping generation")
         return
 
-    # 4. content_block_stop event
-    content_block_stop = {
-        "type": "content_block_stop",
-        "index": 0
-    }
-    yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
+    # Close any open thinking block (model stopped mid-think)
+    if thinking_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        block_index += 1
+        thinking_started = False
 
-    # 5. message_delta with usage
-    message_delta = {
-        "type": "message_delta",
-        "delta": {
-            "stop_reason": stop_reason or "end_turn",
-            "stop_sequence": None
-        },
-        "usage": {
-            "output_tokens": stats_collector.total_tokens
-        }
-    }
-    yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+    # If we never decided (very short output), resolve now
+    if buffering is None:
+        buffering = any(full_text.startswith(p) for p in TOOL_CALL_PREFIXES)
+        if not buffering:
+            if not text_started:
+                text_block_index = block_index
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_started = True
+                block_index += 1
+            for chunk_text in pending_chunks:
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': chunk_text}})}\n\n"
 
-    # 6. message_stop event
-    message_stop = {
-        "type": "message_stop"
-    }
-    yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+    # Handle tool calls from buffered text
+    if buffering:
+        tool_calls, remaining_content = parse_tool_calls(full_text)
+        if tool_calls:
+            # Start text block if needed, emit remaining text
+            if not text_started:
+                text_block_index = block_index
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_started = True
+                block_index += 1
+            if remaining_content:
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': remaining_content}})}\n\n"
+            # Close text block
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+
+            # Emit tool_use blocks
+            for tc in tool_calls:
+                args = tc.function.arguments
+                if isinstance(args, str):
+                    args = json.loads(args)
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc.id, 'name': tc.function.name, 'input': {}}})}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(args)}})}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                block_index += 1
+
+            stop_reason = "tool_use"
+        else:
+            # Looked like tool call but wasn't — flush as text
+            if not text_started:
+                text_block_index = block_index
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_started = True
+                block_index += 1
+            if full_text:
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': full_text}})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+    else:
+        # No tool calls — ensure text block is started and close it
+        if not text_started:
+            text_block_index = block_index
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+            text_started = True
+            block_index += 1
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+
+    # message_delta with stop_reason and usage
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason or 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': stats_collector.total_tokens}})}\n\n"
+
+    # message_stop
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 async def generate_anthropic_output(
@@ -1324,37 +1424,44 @@ async def generate_anthropic_output(
     stats_collector: GenerationStatsCollector,
     params: MessagesParams,
     prompt_token_count: int,
-) -> AnthropicChatCompletionResponse:
+) -> dict:
     """
-    Collect full generation output and return Anthropic response.
+    Collect full generation output and return native Anthropic Message response.
+    Extracts thinking blocks as {"type": "thinking"} content blocks.
+    Parses tool calls into tool_use content blocks.
     """
     result_text = ""
     generation_result = None
-    logprobs_list = []
 
     for generation_result in generator:
         result_text += generation_result.text
         stats_collector.add_tokens(generation_result.tokens)
 
-        # Collect logprobs if enabled
-        if params.top_logprobs and generation_result.top_logprobs:
-            logprobs_list.extend(generation_result.top_logprobs)
+    # Extract thinking blocks as structured content
+    thinking_text = None
+    think_matches = re.findall(r'<think>(.*?)</think>', result_text, flags=re.DOTALL)
+    if think_matches:
+        thinking_text = "\n".join(m.strip() for m in think_matches)
+        result_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
 
-    # Determine finish reason
-    finish_reason = "length"
+    # Determine stop reason
+    stop_reason = "max_tokens"
     if generation_result and generation_result.stop_condition:
-        stop_reason = generation_result.stop_condition.stop_reason
-        if stop_reason in ("stop_string", "eos_token"):
-            finish_reason = "stop"
-        elif stop_reason == "tool_call":
-            finish_reason = "tool_calls"
+        sr = generation_result.stop_condition.stop_reason
+        if sr in ("stop_string", "eos_token"):
+            stop_reason = "end_turn"
+
+    # Parse tool calls from generated text
+    tool_calls, remaining_content = parse_tool_calls(result_text)
+    if tool_calls:
+        stop_reason = "tool_use"
 
     return build_anthropic_response(
         model=params.model,
-        result_text=result_text,
-        finish_reason=finish_reason,
+        result_text=remaining_content,
+        stop_reason=stop_reason,
         prompt_token_count=prompt_token_count,
         completion_token_count=stats_collector.total_tokens,
-        tokens_per_second=stats_collector.get_tokens_per_second(),
-        logprobs=logprobs_list if logprobs_list else None,
+        tool_calls=tool_calls,
+        thinking_text=thinking_text,
     )

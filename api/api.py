@@ -142,7 +142,11 @@ async def generate(
     # Handle JSON schema validation
     json_schema = None
     if request.format:
-        json_schema = json.dumps(request.format)
+        if hasattr(request.format, 'type') and request.format.type == "json_schema":
+            if request.format.json_schema and request.format.json_schema.schema_:
+                json_schema = json.dumps(request.format.json_schema.schema_)
+        elif hasattr(request.format, 'type') and request.format.type == "json_object":
+            json_schema = json.dumps({"type": "object"})
 
     # Generate the response
     try:
