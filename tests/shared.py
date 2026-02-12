@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 import sys
 import subprocess
@@ -5,6 +6,13 @@ from typing import Optional
 
 from mlx_engine.generate import load_model, load_draft_model, tokenize
 from mlx_engine.utils.prompt_progress_reporter import PromptProgressReporter
+
+
+def read_image_b64(path: Path | str) -> str:
+    """Read an image file and return a base64-encoded UTF-8 string."""
+    resolved_path = Path(path).expanduser().resolve()
+    with open(resolved_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
 
 
 class RecordingReporter(PromptProgressReporter):
@@ -120,6 +128,7 @@ def model_load_and_tokenize_prompt(
     max_kv_size=4096,
     trust_remote_code=False,
     draft_model_name=None,
+    max_seq_nums=None,
 ):
     """Helper method to test a model"""
     print(f"Testing model {model_name}")
@@ -131,6 +140,7 @@ def model_load_and_tokenize_prompt(
     model_kit = load_model(
         model_path=model_path,
         max_kv_size=max_kv_size,
+        max_seq_nums=max_seq_nums,
         trust_remote_code=trust_remote_code,
     )
 
