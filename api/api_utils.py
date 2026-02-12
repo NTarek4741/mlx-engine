@@ -28,6 +28,7 @@ from api.api_models import (
     ChatRequest,
     GenerationOptions,
     FunctionDefinition,
+    FunctionParameters,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionChunk,
@@ -45,6 +46,17 @@ from api.api_models import (
     OpenAIAssistantMessage,
     OpenAIToolMessage,
     OpenAIMessage,
+    # Anthropic models
+    MessageParam,
+    TextBlockParam,
+    ImageBlockParam,
+    ToolUseBlockParam,
+    ToolResultBlockParam,
+    AnthropicTool,
+    AnthropicChatCompletionResponse,
+    AnthropicChoice,
+    AnthropicUsage,
+    MessagesParams,
 )
 
 
@@ -1001,4 +1013,348 @@ async def generate_openai_output(
         prompt_token_count=prompt_token_count,
         completion_token_count=stats_collector.total_tokens,
         tool_calls=tool_calls,
+    )
+
+
+# =============================================================================
+# Anthropic Utility Functions
+# =============================================================================
+
+
+def normalize_system_prompt(system: str | list[TextBlockParam] | None) -> str | None:
+    """
+    Convert Anthropic system prompt format to plain string.
+
+    Args:
+        system: Can be None, str, or list of TextBlockParam
+
+    Returns:
+        Plain string system prompt or None
+    """
+    if system is None:
+        return None
+    if isinstance(system, str):
+        return system
+    # List of TextBlockParam - concatenate all text
+    return "\n".join(block.text for block in system)
+
+
+def anthropic_to_chat_convert(params: MessagesParams) -> ChatRequest:
+    """
+    Convert Anthropic MessagesParams to internal ChatRequest format.
+    Mirrors the pattern of openai_to_chat_convert().
+    """
+    chat_messages = []
+
+    # Handle system prompt (Anthropic has it as a separate field)
+    system_str = normalize_system_prompt(params.system)
+    if system_str:
+        chat_messages.append(OllamaMessage(
+            role="system",
+            content=system_str,
+        ))
+
+    # Convert each Anthropic message
+    for msg in params.messages:
+        if isinstance(msg.content, str):
+            chat_messages.append(OllamaMessage(
+                role=msg.role,
+                content=msg.content,
+            ))
+        else:
+            # Process content blocks
+            text_parts = []
+            image_list = []
+            tool_call_list = []
+
+            for block in msg.content:
+                if isinstance(block, TextBlockParam) or (hasattr(block, 'type') and block.type == "text"):
+                    text_parts.append(block.text)
+                elif isinstance(block, ImageBlockParam) or (hasattr(block, 'type') and block.type == "image"):
+                    if block.source.type == "base64":
+                        image_list.append(block.source.data)
+                    elif block.source.type == "url":
+                        image_list.append(image_url_to_base64(block.source.url))
+                elif isinstance(block, ToolUseBlockParam) or (hasattr(block, 'type') and block.type == "tool_use"):
+                    tool_call_list.append(OllamaToolCall(
+                        id=block.id,
+                        type="function",
+                        function=OllamaToolCallFunction(
+                            name=block.name,
+                            arguments=block.input if isinstance(block.input, dict) else json.loads(block.input)
+                        )
+                    ))
+                elif isinstance(block, ToolResultBlockParam) or (hasattr(block, 'type') and block.type == "tool_result"):
+                    # Tool results become separate "tool" role messages
+                    tool_content = block.content
+                    if isinstance(tool_content, list):
+                        tool_content = "\n".join(
+                            b.text if hasattr(b, 'text') else str(b)
+                            for b in tool_content
+                        )
+                    chat_messages.append(OllamaMessage(
+                        role="tool",
+                        content=tool_content or "",
+                        tool_call_id=block.tool_use_id,
+                    ))
+
+            content = "\n".join(text_parts) if text_parts else ""
+            images = image_list if image_list else None
+            tool_calls = tool_call_list if tool_call_list else None
+
+            # Add the main message if there's content or tool calls
+            if content or tool_calls:
+                chat_messages.append(OllamaMessage(
+                    role=msg.role,
+                    content=content,
+                    images=images,
+                    tool_calls=tool_calls,
+                ))
+            elif images:
+                # Image-only message
+                chat_messages.append(OllamaMessage(
+                    role=msg.role,
+                    content="",
+                    images=images,
+                ))
+
+    # Convert Anthropic tools to Chat tools (OpenAI format)
+    chat_tools = None
+    if params.tools:
+        chat_tools = []
+        for tool in params.tools:
+            chat_tools.append(Tool(
+                type="function",
+                function=FunctionDefinition(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=FunctionParameters(
+                        type=tool.input_schema.type,
+                        properties=tool.input_schema.properties,
+                        required=tool.input_schema.required,
+                    ) if tool.input_schema else None,
+                )
+            ))
+
+    # Build GenerationOptions from Anthropic params
+    options = GenerationOptions(
+        temperature=params.temperature,
+        top_k=params.top_k,
+        top_p=params.top_p,
+        num_predict=params.max_tokens,
+        stop=params.stop_sequences,
+        num_ctx=params.max_kv_size,
+        kv_bits=params.kv_bits,
+        kv_group_size=params.kv_group_size,
+        quantized_kv_start=params.quantized_kv_start,
+        draft_model=params.draft_model,
+        num_draft_tokens=params.num_draft_tokens,
+    )
+
+    # Handle JSON schema
+    format_value = None
+    if params.json_schema:
+        format_value = json.loads(params.json_schema) if isinstance(params.json_schema, str) else params.json_schema
+
+    return ChatRequest(
+        model=params.model,
+        messages=chat_messages,
+        tools=chat_tools,
+        format=format_value,
+        options=options,
+        stream=params.stream if params.stream is not None else False,
+        logprobs=params.top_logprobs > 0 if params.top_logprobs else False,
+        top_logprobs=params.top_logprobs or 0,
+    )
+
+
+def build_anthropic_response(
+    model: str,
+    result_text: str,
+    finish_reason: str,
+    prompt_token_count: int,
+    completion_token_count: int,
+    tokens_per_second: float | None,
+    logprobs: list | None = None
+) -> AnthropicChatCompletionResponse:
+    """
+    Build Anthropic ChatCompletionResponse from generation results.
+    """
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    return AnthropicChatCompletionResponse(
+        id=response_id,
+        created=int(time.time()),
+        model=model,
+        choices=[
+            AnthropicChoice(
+                index=0,
+                message=MessageParam(
+                    role="assistant",
+                    content=[TextBlockParam(type="text", text=result_text)]
+                ),
+                finish_reason=finish_reason,
+                logprobs=logprobs,
+            )
+        ],
+        usage=AnthropicUsage(
+            prompt_tokens=prompt_token_count,
+            completion_tokens=completion_token_count,
+            total_tokens=prompt_token_count + completion_token_count,
+            tokens_per_second=tokens_per_second,
+        ),
+    )
+
+
+async def anthropic_stream(
+    generator,
+    model_name: str,
+    stats_collector: GenerationStatsCollector,
+    prompt_tokens: list[int],
+    include_logprobs: bool,
+    top_logprobs: int
+) -> AsyncGenerator[str, None]:
+    """
+    Stream generation results in Anthropic SSE format.
+
+    Yields SSE events with format:
+    - event: message_start
+    - event: content_block_start
+    - event: content_block_delta (text chunks)
+    - event: content_block_stop
+    - event: message_delta (usage stats)
+    - event: message_stop
+    """
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    # 1. message_start event
+    message_start = {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model_name,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": len(prompt_tokens),
+                "output_tokens": 0
+            }
+        }
+    }
+    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+    # 2. content_block_start event
+    content_block_start = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "text",
+            "text": ""
+        }
+    }
+    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+
+    # 3. Stream content deltas
+    stop_reason = None
+    try:
+        for generation_result in generator:
+            # Check if client disconnected
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                print("Client disconnected, stopping generation")
+                return
+
+            stats_collector.add_tokens(generation_result.tokens)
+
+            if generation_result.text:
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": generation_result.text
+                    }
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+            if generation_result.stop_condition:
+                stop_reason = generation_result.stop_condition.stop_reason
+                if stop_reason in ("stop_string", "eos_token"):
+                    stop_reason = "end_turn"
+                elif stop_reason == "max_tokens":
+                    stop_reason = "max_tokens"
+                break
+    except asyncio.CancelledError:
+        print("Client disconnected, stopping generation")
+        return
+
+    # 4. content_block_stop event
+    content_block_stop = {
+        "type": "content_block_stop",
+        "index": 0
+    }
+    yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
+
+    # 5. message_delta with usage
+    message_delta = {
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": stop_reason or "end_turn",
+            "stop_sequence": None
+        },
+        "usage": {
+            "output_tokens": stats_collector.total_tokens
+        }
+    }
+    yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+
+    # 6. message_stop event
+    message_stop = {
+        "type": "message_stop"
+    }
+    yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+
+
+async def generate_anthropic_output(
+    generator,
+    stats_collector: GenerationStatsCollector,
+    params: MessagesParams,
+    prompt_token_count: int,
+) -> AnthropicChatCompletionResponse:
+    """
+    Collect full generation output and return Anthropic response.
+    """
+    result_text = ""
+    generation_result = None
+    logprobs_list = []
+
+    for generation_result in generator:
+        result_text += generation_result.text
+        stats_collector.add_tokens(generation_result.tokens)
+
+        # Collect logprobs if enabled
+        if params.top_logprobs and generation_result.top_logprobs:
+            logprobs_list.extend(generation_result.top_logprobs)
+
+    # Determine finish reason
+    finish_reason = "length"
+    if generation_result and generation_result.stop_condition:
+        stop_reason = generation_result.stop_condition.stop_reason
+        if stop_reason in ("stop_string", "eos_token"):
+            finish_reason = "stop"
+        elif stop_reason == "tool_call":
+            finish_reason = "tool_calls"
+
+    return build_anthropic_response(
+        model=params.model,
+        result_text=result_text,
+        finish_reason=finish_reason,
+        prompt_token_count=prompt_token_count,
+        completion_token_count=stats_collector.total_tokens,
+        tokens_per_second=stats_collector.get_tokens_per_second(),
+        logprobs=logprobs_list if logprobs_list else None,
     )

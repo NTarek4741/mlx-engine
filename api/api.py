@@ -35,11 +35,8 @@ from api.api_models import (
     RunningModelInfo,
     ModelsListResponse,
     ModelObject,
+    MessagesParams,
 )
-
-# Anthropic API imports
-from anthropic.anthropic import messages as anthropic_messages
-from anthropic.anthropic_models import MessagesParams
 
 # Import utility functions
 from api.api_utils import (
@@ -54,6 +51,9 @@ from api.api_utils import (
     openai_to_chat_convert,
     openai_stream,
     generate_openai_output,
+    anthropic_to_chat_convert,
+    anthropic_stream,
+    generate_anthropic_output,
 )
 
 # Import API examples
@@ -77,103 +77,103 @@ app = FastAPI()
 logger = logging.getLogger(__name__)
 
 
-# # POST - Generate a response
-# @app.post("/api/generate")
-# async def generate(
-#     request: Annotated[GenerateRequest, Body(examples=GENERATE_EXAMPLES)]
-# ):
-#     """
-#     Generate a text completion response.
+# POST - Generate a response
+@app.post("/api/generate")
+async def generate(
+    request: Annotated[GenerateRequest, Body(examples=GENERATE_EXAMPLES)]
+):
+    """
+    Generate a text completion response.
 
-#     Description:
-#         Processes a prompt and generates text using the specified model.
-#         Supports both streaming and non-streaming responses, images for
-#         vision models, and structured JSON output.
+    Description:
+        Processes a prompt and generates text using the specified model.
+        Supports both streaming and non-streaming responses, images for
+        vision models, and structured JSON output.
 
-#     Args:
-#         request (GenerateRequest): The generation request containing:
-#             - model: The model identifier to use
-#             - prompt: The input prompt text
-#             - system: Optional system prompt
-#             - options: Generation options (temperature, top_k, etc.)
-#             - stream: Whether to stream the response
-#             - images: Optional list of base64-encoded images
-#             - format: Optional JSON schema for structured output
-#             - raw: Whether to use raw prompt without template
+    Args:
+        request (GenerateRequest): The generation request containing:
+            - model: The model identifier to use
+            - prompt: The input prompt text
+            - system: Optional system prompt
+            - options: Generation options (temperature, top_k, etc.)
+            - stream: Whether to stream the response
+            - images: Optional list of base64-encoded images
+            - format: Optional JSON schema for structured output
+            - raw: Whether to use raw prompt without template
 
-#     Returns:
-#         StreamingResponse | GenerateResponse | dict[str, str]: Either a streaming
-#             response for real-time generation, a GenerateResponse object with
-#             the complete generated text and statistics, or an error dictionary.
-#     """
-#     model_name = request.model.split(":")[0] if ":" in request.model else request.model
+    Returns:
+        StreamingResponse | GenerateResponse | dict[str, str]: Either a streaming
+            response for real-time generation, a GenerateResponse object with
+            the complete generated text and statistics, or an error dictionary.
+    """
+    model_name = request.model.split(":")[0] if ":" in request.model else request.model
 
-#     # Use default GenerationOptions if not provided
-#     options = request.options or GenerationOptions()
-#     try:
-#         model_kit, load_duration_ns = load_and_cache_model(
-#             model = model_name,
-#             num_ctx = None,
-#             kv_bits = options.kv_bits,
-#             kv_group_size = options.kv_group_size,
-#             quantized_kv_start = options.quantized_kv_start,
-#             draft_model = options.draft_model
-#         )
-#     except Exception as e:
-#         logger.info(f"Error while loading: {str(e)}")
-#         return {'error': f"Error while loading: {str(e)}"}
+    # Use default GenerationOptions if not provided
+    options = request.options or GenerationOptions()
+    try:
+        model_kit, load_duration_ns = load_and_cache_model(
+            model = model_name,
+            num_ctx = None,
+            kv_bits = options.kv_bits,
+            kv_group_size = options.kv_group_size,
+            quantized_kv_start = options.quantized_kv_start,
+            draft_model = options.draft_model
+        )
+    except Exception as e:
+        logger.info(f"Error while loading: {str(e)}")
+        return {'error': f"Error while loading: {str(e)}"}
 
-#     try:
-#         prompt_tokens = prompt_render(
-#             request.raw,
-#             request.images,
-#             request.prompt,
-#             request.system,
-#             request.model,
-#             request.suffix
-#         )
-#     except Exception as e:
-#         logger.info(f"Error while rendering prompt: {str(e)}")
-#         return {'error': f"Error while rendering prompt: {str(e)}"}
+    try:
+        prompt_tokens = prompt_render(
+            request.raw,
+            request.images,
+            request.prompt,
+            request.system,
+            request.model,
+            request.suffix
+        )
+    except Exception as e:
+        logger.info(f"Error while rendering prompt: {str(e)}")
+        return {'error': f"Error while rendering prompt: {str(e)}"}
 
-#     stats_collector = GenerationStatsCollector()
-#     stats_collector.load_duration = load_duration_ns
+    stats_collector = GenerationStatsCollector()
+    stats_collector.load_duration = load_duration_ns
 
-#     # Handle JSON schema validation
-#     json_schema = None
-#     if request.format:
-#         json_schema = json.dumps(request.format)
+    # Handle JSON schema validation
+    json_schema = None
+    if request.format:
+        json_schema = json.dumps(request.format)
 
-#     # Generate the response
-#     try:
-#         generator = create_generator(
-#             model_kit,
-#             prompt_tokens,
-#             images_b64=request.images,
-#             stop_strings=options.stop,
-#             max_tokens=options.num_predict,
-#             top_logprobs=request.top_logprobs if request.logprobs else None,
-#             prompt_progress_reporter=LoggerReporter(),
-#             seed=options.seed,
-#             temp=options.temperature,
-#             top_k=options.top_k,
-#             top_p=options.top_p,
-#             min_p=options.min_p,
-#             json_schema=json_schema,
-#         )
-#     except Exception as e:
-#         logger.info(f"Error creating generator: {str(e)}")
-#         return {'error': f"Error creating generator: {str(e)}"}
-#     try:
-#         if request.stream:
-#             return StreamingResponse(
-#                 generate_stream(generator, request.model, stats_collector, prompt_tokens, request.logprobs, request.top_logprobs)
-#             )
-#         else:
-#             return await generate_output(generator, stats_collector, request, prompt_tokens)
-#     except Exception as e:
-#         logger.info(f"Error while generating: {str(e)}")
-#         return {'error': f"Error while generating: {str(e)}"}
+    # Generate the response
+    try:
+        generator = create_generator(
+            model_kit,
+            prompt_tokens,
+            images_b64=request.images,
+            stop_strings=options.stop,
+            max_tokens=options.num_predict,
+            top_logprobs=request.top_logprobs if request.logprobs else None,
+            prompt_progress_reporter=LoggerReporter(),
+            seed=options.seed,
+            temp=options.temperature,
+            top_k=options.top_k,
+            top_p=options.top_p,
+            min_p=options.min_p,
+            json_schema=json_schema,
+        )
+    except Exception as e:
+        logger.info(f"Error creating generator: {str(e)}")
+        return {'error': f"Error creating generator: {str(e)}"}
+    try:
+        if request.stream:
+            return StreamingResponse(
+                generate_stream(generator, request.model, stats_collector, prompt_tokens, request.logprobs, request.top_logprobs)
+            )
+        else:
+            return await generate_output(generator, stats_collector, request, prompt_tokens)
+    except Exception as e:
+        logger.info(f"Error while generating: {str(e)}")
+        return {'error': f"Error while generating: {str(e)}"}
 
 
 # POST - Generate a chat message
@@ -270,6 +270,7 @@ async def engine_core(options, model_name, request):
             top_p=options.top_p,
             min_p=options.min_p,
             json_schema=json_schema,
+            num_draft_tokens=options.num_draft_tokens,
         )
     except Exception as e:
         logger.info(f"Error creating generator: {str(e)}")
@@ -313,6 +314,8 @@ async def messages(
 
     Description:
         Processes messages using the Anthropic API format and generates responses.
+        Converts Anthropic format to internal ChatRequest, runs through engine_core,
+        then returns an Anthropic-format response.
         Supports both streaming and non-streaming modes.
 
     Args:
@@ -330,7 +333,34 @@ async def messages(
             usage statistics, and stop reason.
     """
     try:
-        return await anthropic_messages(params)
+        # 1. Convert Anthropic params to ChatRequest
+        request = anthropic_to_chat_convert(params)
+
+        # 2. Run through engine_core (same pattern as OpenAI)
+        generator, stats_collector, prompt_tokens = await engine_core(
+            request.options, params.model, request
+        )
+
+        # 3. Return Anthropic-format response
+        if params.stream:
+            return StreamingResponse(
+                anthropic_stream(
+                    generator,
+                    params.model,
+                    stats_collector,
+                    prompt_tokens,
+                    params.top_logprobs > 0 if params.top_logprobs else False,
+                    params.top_logprobs or 0,
+                ),
+                media_type="text/event-stream",
+            )
+        else:
+            return await generate_anthropic_output(
+                generator,
+                stats_collector,
+                params,
+                len(prompt_tokens),
+            )
     except Exception as e:
         logger.info(f"Error processing Anthropic messages request: {str(e)}")
         return {"error": f"Error processing messages request: {str(e)}"}
@@ -396,7 +426,7 @@ async def chat_completions(
 
 
 # =============================================================================
-# Convenience Engine Endpoints
+# Convenience Endpoints
 # =============================================================================
 
 # GET - List models
